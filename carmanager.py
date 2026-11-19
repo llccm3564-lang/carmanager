@@ -44,6 +44,34 @@ try:
 except ImportError:
     pass
 
+# ── 로그 자동 저장 (화면 + log.txt 동시 출력) ──
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_log_path = os.path.join(_script_dir, "log.txt")
+
+class _Tee:
+    def __init__(self, *streams):
+        self._streams = streams
+    def write(self, text):
+        for s in self._streams:
+            try:
+                s.write(text)
+                s.flush()
+            except Exception:
+                pass
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+try:
+    _log_file = open(_log_path, "w", encoding="utf-8")
+    sys.stdout = _Tee(sys.__stdout__, _log_file)
+    sys.stderr = _Tee(sys.__stderr__, _log_file)
+except Exception:
+    pass
+
 try:
     from supabase import create_client
 except ImportError:
