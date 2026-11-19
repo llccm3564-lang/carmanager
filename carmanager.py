@@ -681,25 +681,24 @@ def HTML에서_차량_추출(html):
 def _검색_초기화(드라이버):
     """이전 검색 조건(북마크) 제거 + 페이지당 표시 수 100으로"""
     print("  검색 조건 초기화 중...")
+
+    # 1단계: 모든 검색 필드 비우기
     드라이버.execute_script("""
-        // 모든 텍스트 input 비우기
         document.querySelectorAll('input[type="text"]').forEach(function(inp) {
             inp.value = '';
         });
-        // 모든 hidden input 중 검색 관련 비우기
         document.querySelectorAll('input[type="hidden"]').forEach(function(inp) {
             if (inp.name && (inp.name.indexOf('Search') > -1 || inp.name.indexOf('Maker') > -1
-                || inp.name.indexOf('Model') > -1 || inp.name.indexOf('Grade') > -1)) {
+                || inp.name.indexOf('Model') > -1 || inp.name.indexOf('Grade') > -1
+                || inp.name.indexOf('CarNumber') > -1 || inp.name.indexOf('Bookmark') > -1)) {
                 inp.value = '';
             }
         });
-        // select 초기화
         document.querySelectorAll('select').forEach(function(sel) {
             if (sel.name && sel.name !== 'sbxPageRowCount') {
                 sel.selectedIndex = 0;
             }
         });
-        // 페이지당 100건 표시
         var rowSel = document.querySelector('select[name="sbxPageRowCount"]');
         if (rowSel) {
             for (var i = 0; i < rowSel.options.length; i++) {
@@ -711,17 +710,58 @@ def _검색_초기화(드라이버):
             if (parseInt(rowSel.value) < 50) rowSel.value = '50';
         }
     """)
-    # form 직접 submit (goFormSubmitType이 없을 수 있으므로)
+
+    # 2단계: 검색 실행 (카매니저 JS 함수 → 버튼 클릭 → form.submit 순서로 시도)
     try:
-        드라이버.execute_script("""
+        method = 드라이버.execute_script("""
+            if (typeof goFormSubmitType === 'function') { goFormSubmitType(); return 'goFormSubmitType'; }
+            if (typeof goSearchSubmit === 'function') { goSearchSubmit(); return 'goSearchSubmit'; }
+            if (typeof goPageSubmit === 'function') { goPageSubmit(1); return 'goPageSubmit(1)'; }
+            var btn = document.querySelector('.btn_search, [onclick*="goForm"], [onclick*="Submit"], button[type="submit"]');
+            if (btn) { btn.click(); return 'button_click'; }
             var form = document.querySelector('form');
-            if (form) form.submit();
+            if (form) { form.submit(); return 'form.submit'; }
+            return 'none';
         """)
+        print(f"  검색 방식: {method}")
     except Exception:
         pass
     time.sleep(5)
     alert_처리(드라이버)
-    print("  검색 초기화 완료")
+
+    # 3단계: 결과 확인 — 0건이면 페이지 재접속 (fallback)
+    rows = 드라이버.execute_script("return document.querySelectorAll('tr.uc_carcss').length")
+    if rows == 0:
+        print("  결과 0건 → 페이지 재접속 시도...")
+        드라이버.get(f"{사이트}/Car/Data")
+        time.sleep(5)
+        for _ in range(3):
+            alert_처리(드라이버)
+            time.sleep(1)
+        # 페이지당 100건 설정만 다시
+        드라이버.execute_script("""
+            var rowSel = document.querySelector('select[name="sbxPageRowCount"]');
+            if (rowSel) {
+                for (var i = 0; i < rowSel.options.length; i++) {
+                    if (parseInt(rowSel.options[i].value) >= 100) {
+                        rowSel.value = rowSel.options[i].value;
+                        break;
+                    }
+                }
+            }
+        """)
+        try:
+            드라이버.execute_script("""
+                if (typeof goFormSubmitType === 'function') goFormSubmitType();
+                else if (typeof goPageSubmit === 'function') goPageSubmit(1);
+            """)
+        except Exception:
+            pass
+        time.sleep(5)
+        alert_처리(드라이버)
+
+    rows = 드라이버.execute_script("return document.querySelectorAll('tr.uc_carcss').length")
+    print(f"  검색 초기화 완료 (현재 {rows}건 표시)")
 
 
 def 전체_수집(드라이버):
