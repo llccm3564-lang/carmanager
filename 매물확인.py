@@ -72,6 +72,38 @@ try:
 except Exception:
     pass
 
+# ── 종료 시 로그를 Supabase에 자동 업로드 ──
+import atexit
+
+def _upload_log_to_supabase():
+    try:
+        _log_file.flush()
+        log_content = open(_log_path, "r", encoding="utf-8").read()
+        if not log_content.strip():
+            return
+        url = os.environ.get("SUPABASE_URL", "")
+        key = os.environ.get("SUPABASE_KEY", "")
+        if not url or not key:
+            return
+        requests.post(
+            f"{url}/rest/v1/error_logs",
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal"
+            },
+            json={
+                "content": log_content[-50000:],
+                "pc_name": os.environ.get("COMPUTERNAME", "unknown")
+            },
+            timeout=10
+        )
+    except Exception:
+        pass
+
+atexit.register(_upload_log_to_supabase)
+
 try:
     from supabase import create_client
 except ImportError:
