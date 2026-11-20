@@ -705,24 +705,72 @@ def _검색_초기화(드라이버, 아이디, 비밀번호):
     if 상태.get('t'):
         print(f"  [전] text: {상태['t']}")
 
-    # 1단계: hidden input 전수 비우기 (페이지네이션/CSRF만 보존)
+    # 1단계: 셀렉트 옵션 디버깅 출력 + 전체 초기화
+    셀렉트_정보 = 드라이버.execute_script("""
+        var info = [];
+        document.querySelectorAll('select').forEach(function(s){
+            if (!s.name) return;
+            var opts = [];
+            for (var i=0; i<Math.min(s.options.length, 5); i++) {
+                opts.push(i + ':' + s.options[i].value + '=' + s.options[i].text.trim());
+            }
+            info.push(s.name + ' [' + s.selectedIndex + '] → ' + opts.join(' | '));
+        });
+        return info;
+    """)
+    for s in (셀렉트_정보 or []):
+        print(f"  [select] {s}")
+
+    # hidden 전수 비우기 + select를 "전체"로 + 100건 설정
     드라이버.execute_script("""
         var keep = ['PageNumber','PageRow','PageTCount','__RequestVerificationToken'];
+
+        // text input 비우기
         document.querySelectorAll('input[type="text"]').forEach(function(i){ i.value=''; });
+
+        // hidden input 전수 비우기
         document.querySelectorAll('input[type="hidden"]').forEach(function(i){
             if (i.name && keep.indexOf(i.name)===-1) i.value='';
         });
+
+        // PageNumber = 1
         var pn = document.querySelector('input[name="PageNumber"]');
         if (pn) pn.value = '1';
+
+        // 모든 select를 "전체"로 (sbxPageRowCount 제외)
         document.querySelectorAll('select').forEach(function(s){
-            if (s.name && s.name!=='sbxPageRowCount') s.selectedIndex=0;
+            if (!s.name || s.name==='sbxPageRowCount') return;
+            var found = false;
+            for (var i=0; i<s.options.length; i++) {
+                var t = s.options[i].text.trim();
+                var v = s.options[i].value;
+                if (t==='전체' || t==='전체선택' || t==='-- 전체 --' || t==='선택' || v==='' || v==='0' || v==='-1') {
+                    s.selectedIndex = i;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) s.selectedIndex = 0;
+            // change 이벤트 발생 (연동된 hidden 필드 업데이트)
+            s.dispatchEvent(new Event('change', {bubbles:true}));
         });
+
+        // 페이지당 100건
         var rs = document.querySelector('select[name="sbxPageRowCount"]');
         if (rs) {
             for (var i=0; i<rs.options.length; i++) {
                 if (parseInt(rs.options[i].value)>=100) { rs.value=rs.options[i].value; break; }
             }
         }
+    """)
+    time.sleep(1)
+
+    # change 이벤트 후 hidden이 다시 채워졌을 수 있으므로 한 번 더 비우기
+    드라이버.execute_script("""
+        var keep = ['PageNumber','PageRow','PageTCount','__RequestVerificationToken'];
+        document.querySelectorAll('input[type="hidden"]').forEach(function(i){
+            if (i.name && keep.indexOf(i.name)===-1) i.value='';
+        });
     """)
 
     # 2단계: 검색 실행
@@ -778,15 +826,29 @@ def _검색_초기화(드라이버, 아이디, 비밀번호):
             alert_처리(드라이버)
             time.sleep(1)
 
-        # 다시 전수 비우기 + 100건 + 검색
+        # 다시 전수 비우기 + select "전체" + 100건 + 검색
         드라이버.execute_script("""
             var keep = ['PageNumber','PageRow','PageTCount','__RequestVerificationToken'];
             document.querySelectorAll('input[type="text"]').forEach(function(i){ i.value=''; });
             document.querySelectorAll('input[type="hidden"]').forEach(function(i){
                 if (i.name && keep.indexOf(i.name)===-1) i.value='';
             });
+            var pn = document.querySelector('input[name="PageNumber"]');
+            if (pn) pn.value = '1';
             document.querySelectorAll('select').forEach(function(s){
-                if (s.name && s.name!=='sbxPageRowCount') s.selectedIndex=0;
+                if (!s.name || s.name==='sbxPageRowCount') return;
+                var found = false;
+                for (var i=0; i<s.options.length; i++) {
+                    var t = s.options[i].text.trim();
+                    var v = s.options[i].value;
+                    if (t==='전체' || t==='전체선택' || t==='-- 전체 --' || t==='선택' || v==='' || v==='0' || v==='-1') {
+                        s.selectedIndex = i;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) s.selectedIndex = 0;
+                s.dispatchEvent(new Event('change', {bubbles:true}));
             });
             var rs = document.querySelector('select[name="sbxPageRowCount"]');
             if (rs) {
@@ -794,6 +856,14 @@ def _검색_초기화(드라이버, 아이디, 비밀번호):
                     if (parseInt(rs.options[i].value)>=100) { rs.value=rs.options[i].value; break; }
                 }
             }
+        """)
+        time.sleep(1)
+        # change 이벤트 후 hidden 다시 비우기
+        드라이버.execute_script("""
+            var keep = ['PageNumber','PageRow','PageTCount','__RequestVerificationToken'];
+            document.querySelectorAll('input[type="hidden"]').forEach(function(i){
+                if (i.name && keep.indexOf(i.name)===-1) i.value='';
+            });
         """)
         try:
             드라이버.execute_script("""
