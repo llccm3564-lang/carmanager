@@ -679,7 +679,7 @@ def HTML에서_차량_추출(html):
 # 수집 엔진
 # ════════════════════════════════════════════════════════════
 def _검색_초기화(드라이버, 아이디, 비밀번호):
-    """이전 검색 조건(북마크) 완전 제거 + 페이지당 100건 설정"""
+    """검색 필터 초기화 + 페이지당 50건 설정"""
     print("  검색 조건 초기화 중...")
 
     # 디버깅: 초기화 전 상태
@@ -721,23 +721,11 @@ def _검색_초기화(드라이버, 아이디, 비밀번호):
     for s in (셀렉트_정보 or []):
         print(f"  [select] {s}")
 
-    # hidden 전수 비우기 + select를 "전체"로 + 100건 설정
+    # text input만 비우기 + select "전체" + 50건 (사이트 최대)
+    # hidden은 비우지 않음 (PageTCount 등 서버 값 보존)
     드라이버.execute_script("""
-        var keep = ['PageNumber','PageRow','PageTCount','__RequestVerificationToken'];
-
-        // text input 비우기
         document.querySelectorAll('input[type="text"]').forEach(function(i){ i.value=''; });
 
-        // hidden input 전수 비우기
-        document.querySelectorAll('input[type="hidden"]').forEach(function(i){
-            if (i.name && keep.indexOf(i.name)===-1) i.value='';
-        });
-
-        // PageNumber = 1
-        var pn = document.querySelector('input[name="PageNumber"]');
-        if (pn) pn.value = '1';
-
-        // 모든 select를 "전체"로 (sbxPageRowCount 제외)
         document.querySelectorAll('select').forEach(function(s){
             if (!s.name || s.name==='sbxPageRowCount') return;
             var found = false;
@@ -751,27 +739,21 @@ def _검색_초기화(드라이버, 아이디, 비밀번호):
                 }
             }
             if (!found) s.selectedIndex = 0;
-            // change 이벤트 발생 (연동된 hidden 필드 업데이트)
             s.dispatchEvent(new Event('change', {bubbles:true}));
         });
 
-        // 페이지당 100건
         var rs = document.querySelector('select[name="sbxPageRowCount"]');
         if (rs) {
             for (var i=0; i<rs.options.length; i++) {
-                if (parseInt(rs.options[i].value)>=100) { rs.value=rs.options[i].value; break; }
+                if (rs.options[i].value === '50') { rs.selectedIndex = i; break; }
             }
+            rs.dispatchEvent(new Event('change', {bubbles:true}));
         }
+
+        var pr = document.querySelector('input[name="PageRow"]');
+        if (pr) pr.value = '50';
     """)
     time.sleep(1)
-
-    # change 이벤트 후 hidden이 다시 채워졌을 수 있으므로 한 번 더 비우기
-    드라이버.execute_script("""
-        var keep = ['PageNumber','PageRow','PageTCount','__RequestVerificationToken'];
-        document.querySelectorAll('input[type="hidden"]').forEach(function(i){
-            if (i.name && keep.indexOf(i.name)===-1) i.value='';
-        });
-    """)
 
     # 2단계: 검색 실행
     try:
@@ -810,14 +792,13 @@ def _검색_초기화(드라이버, 아이디, 비밀번호):
     if 상태2.get('h'):
         print(f"  [후] hidden: {상태2['h']}")
 
-    # 4단계: 50건 미만이면 쿠키 전체 삭제 + 재로그인 + 재접속
-    if rows < 50:
-        print(f"  {rows}건뿐 → 쿠키 전체 삭제 후 재로그인...")
+    # 0건이면 쿠키 삭제 + 재로그인 + 재시도
+    if rows == 0:
+        print("  0건 → 쿠키 삭제 후 재로그인...")
         드라이버.delete_all_cookies()
 
         if not 로그인(드라이버, 아이디, 비밀번호):
             print("  재로그인 실패!")
-            print(f"  검색 초기화 완료 (현재 {rows}건 표시)")
             return
 
         드라이버.get(f"{사이트}/Car/Data")
@@ -826,45 +807,24 @@ def _검색_초기화(드라이버, 아이디, 비밀번호):
             alert_처리(드라이버)
             time.sleep(1)
 
-        # 다시 전수 비우기 + select "전체" + 100건 + 검색
         드라이버.execute_script("""
-            var keep = ['PageNumber','PageRow','PageTCount','__RequestVerificationToken'];
             document.querySelectorAll('input[type="text"]').forEach(function(i){ i.value=''; });
-            document.querySelectorAll('input[type="hidden"]').forEach(function(i){
-                if (i.name && keep.indexOf(i.name)===-1) i.value='';
-            });
-            var pn = document.querySelector('input[name="PageNumber"]');
-            if (pn) pn.value = '1';
             document.querySelectorAll('select').forEach(function(s){
                 if (!s.name || s.name==='sbxPageRowCount') return;
-                var found = false;
-                for (var i=0; i<s.options.length; i++) {
-                    var t = s.options[i].text.trim();
-                    var v = s.options[i].value;
-                    if (t==='전체' || t==='전체선택' || t==='-- 전체 --' || t==='선택' || v==='' || v==='0' || v==='-1') {
-                        s.selectedIndex = i;
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) s.selectedIndex = 0;
+                s.selectedIndex = 0;
                 s.dispatchEvent(new Event('change', {bubbles:true}));
             });
             var rs = document.querySelector('select[name="sbxPageRowCount"]');
             if (rs) {
                 for (var i=0; i<rs.options.length; i++) {
-                    if (parseInt(rs.options[i].value)>=100) { rs.value=rs.options[i].value; break; }
+                    if (rs.options[i].value === '50') { rs.selectedIndex = i; break; }
                 }
+                rs.dispatchEvent(new Event('change', {bubbles:true}));
             }
+            var pr = document.querySelector('input[name="PageRow"]');
+            if (pr) pr.value = '50';
         """)
         time.sleep(1)
-        # change 이벤트 후 hidden 다시 비우기
-        드라이버.execute_script("""
-            var keep = ['PageNumber','PageRow','PageTCount','__RequestVerificationToken'];
-            document.querySelectorAll('input[type="hidden"]').forEach(function(i){
-                if (i.name && keep.indexOf(i.name)===-1) i.value='';
-            });
-        """)
         try:
             드라이버.execute_script("""
                 if (typeof goFormSubmitType === 'function') goFormSubmitType();
@@ -977,7 +937,15 @@ def _총_페이지_수(드라이버):
                 var r = parseInt(pr.value);
                 if (t > 0 && r > 0) return Math.ceil(t / r);
             }
-            // 방법 3: 페이지 링크에서 최대값
+            // 방법 3: hdfCarRowCount (총 차량 수)
+            var hdf = document.querySelector('input[name="hdfCarRowCount"]');
+            if (hdf) {
+                var t = parseInt(hdf.value);
+                var rowCount = 50;
+                if (pr) { var rv = parseInt(pr.value); if (rv > 0) rowCount = rv; }
+                if (t > 0) return Math.ceil(t / rowCount);
+            }
+            // 방법 4: 페이지 링크에서 최대값
             var max = 1;
             document.querySelectorAll('a').forEach(function(a) {
                 var oc = a.getAttribute('onclick') || '';
