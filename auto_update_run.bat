@@ -1,16 +1,18 @@
 @echo off
-title CarManager Auto Update
+title CarManager Auto Loop
 
+:LOOP
 set "DIR=%~dp0"
 set "TEMP_ZIP=%TEMP%\cm_update.zip"
 set "TEMP_DIR=%TEMP%\cm_update"
 
+echo ========================================
 echo [1/4] Downloading latest version...
 powershell -Command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://github.com/llccm3564-lang/carmanager/archive/refs/heads/master.zip' -OutFile '%TEMP_ZIP%' -UseBasicParsing } catch { Write-Host 'DOWNLOAD FAILED'; exit 1 }"
 if errorlevel 1 (
-    echo Download failed. Check internet connection.
-    pause
-    exit /b 1
+    echo Download failed. Retrying in 5 minutes...
+    timeout /t 300 /nobreak >nul
+    goto LOOP
 )
 
 echo [2/4] Extracting update...
@@ -28,4 +30,9 @@ if exist "%TEMP%\cm_env_backup" (
 echo [4/4] Installing packages and running...
 py -m pip install -r "%DIR%requirements.txt" -q 2>nul
 py "%DIR%carmanager.py" --headless
-pause
+
+echo.
+echo Run complete. Next run in 5 minutes...
+echo (Press Ctrl+C to stop)
+timeout /t 300 /nobreak >nul
+goto LOOP
