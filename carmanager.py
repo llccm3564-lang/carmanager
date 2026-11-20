@@ -679,39 +679,53 @@ def HTML에서_차량_추출(html):
 # 수집 엔진
 # ════════════════════════════════════════════════════════════
 def _검색_초기화(드라이버):
-    """이전 검색 조건(북마크) 제거 + 페이지당 표시 수 100으로"""
+    """이전 검색 조건(북마크) 완전 제거 + 페이지당 100건 설정"""
     print("  검색 조건 초기화 중...")
 
-    # 1단계: 모든 검색 필드 비우기
+    # 디버깅: 초기화 전 상태
+    상태 = 드라이버.execute_script("""
+        var r = {};
+        r.PTC = (typeof PageTCount !== 'undefined') ? PageTCount : 'N/A';
+        r.PR = (typeof PageRow !== 'undefined') ? PageRow : 'N/A';
+        var h = {};
+        document.querySelectorAll('input[type="hidden"]').forEach(function(i) {
+            if (i.name && i.value) h[i.name] = i.value;
+        });
+        r.h = h;
+        var t = {};
+        document.querySelectorAll('input[type="text"]').forEach(function(i) {
+            if (i.value) t[i.name || i.id || '?'] = i.value;
+        });
+        r.t = t;
+        return r;
+    """)
+    print(f"  [전] PageTCount={상태.get('PTC')}, PageRow={상태.get('PR')}")
+    if 상태.get('h'):
+        print(f"  [전] hidden: {상태['h']}")
+    if 상태.get('t'):
+        print(f"  [전] text: {상태['t']}")
+
+    # 1단계: hidden input 전수 비우기 (페이지네이션/CSRF만 보존)
     드라이버.execute_script("""
-        document.querySelectorAll('input[type="text"]').forEach(function(inp) {
-            inp.value = '';
+        var keep = ['PageNumber','PageRow','PageTCount','__RequestVerificationToken'];
+        document.querySelectorAll('input[type="text"]').forEach(function(i){ i.value=''; });
+        document.querySelectorAll('input[type="hidden"]').forEach(function(i){
+            if (i.name && keep.indexOf(i.name)===-1) i.value='';
         });
-        document.querySelectorAll('input[type="hidden"]').forEach(function(inp) {
-            if (inp.name && (inp.name.indexOf('Search') > -1 || inp.name.indexOf('Maker') > -1
-                || inp.name.indexOf('Model') > -1 || inp.name.indexOf('Grade') > -1
-                || inp.name.indexOf('CarNumber') > -1 || inp.name.indexOf('Bookmark') > -1)) {
-                inp.value = '';
-            }
+        var pn = document.querySelector('input[name="PageNumber"]');
+        if (pn) pn.value = '1';
+        document.querySelectorAll('select').forEach(function(s){
+            if (s.name && s.name!=='sbxPageRowCount') s.selectedIndex=0;
         });
-        document.querySelectorAll('select').forEach(function(sel) {
-            if (sel.name && sel.name !== 'sbxPageRowCount') {
-                sel.selectedIndex = 0;
+        var rs = document.querySelector('select[name="sbxPageRowCount"]');
+        if (rs) {
+            for (var i=0; i<rs.options.length; i++) {
+                if (parseInt(rs.options[i].value)>=100) { rs.value=rs.options[i].value; break; }
             }
-        });
-        var rowSel = document.querySelector('select[name="sbxPageRowCount"]');
-        if (rowSel) {
-            for (var i = 0; i < rowSel.options.length; i++) {
-                if (parseInt(rowSel.options[i].value) >= 100) {
-                    rowSel.value = rowSel.options[i].value;
-                    break;
-                }
-            }
-            if (parseInt(rowSel.value) < 50) rowSel.value = '50';
         }
     """)
 
-    # 2단계: 검색 실행 (카매니저 JS 함수 → 버튼 클릭 → form.submit 순서로 시도)
+    # 2단계: 검색 실행
     try:
         method = 드라이버.execute_script("""
             if (typeof goFormSubmitType === 'function') { goFormSubmitType(); return 'goFormSubmitType'; }
@@ -729,24 +743,63 @@ def _검색_초기화(드라이버):
     time.sleep(5)
     alert_처리(드라이버)
 
-    # 3단계: 결과 확인 — 0건이면 페이지 재접속 (fallback)
-    rows = 드라이버.execute_script("return document.querySelectorAll('tr.uc_carcss').length")
-    if rows == 0:
-        print("  결과 0건 → 페이지 재접속 시도...")
+    # 3단계: 검색 후 디버깅
+    상태2 = 드라이버.execute_script("""
+        var r = {};
+        r.PTC = (typeof PageTCount !== 'undefined') ? PageTCount : 'N/A';
+        r.PR = (typeof PageRow !== 'undefined') ? PageRow : 'N/A';
+        r.rows = document.querySelectorAll('tr.uc_carcss').length;
+        r.url = location.href;
+        var h = {};
+        document.querySelectorAll('input[type="hidden"]').forEach(function(i){
+            if (i.name && i.value) h[i.name] = i.value;
+        });
+        r.h = h;
+        return r;
+    """)
+    rows = 상태2.get('rows', 0)
+    print(f"  [후] PageTCount={상태2.get('PTC')}, PageRow={상태2.get('PR')}, 행수={rows}")
+    if 상태2.get('h'):
+        print(f"  [후] hidden: {상태2['h']}")
+
+    # 4단계: 50건 미만이면 쿠키 삭제 + 재접속 (서버 세션 리셋)
+    if rows < 50:
+        print(f"  {rows}건뿐 → 쿠키 삭제 후 재접속...")
+        try:
+            cookies = 드라이버.get_cookies()
+            유지 = 0
+            삭제 = 0
+            for c in cookies:
+                nm = c['name'].lower()
+                if any(x in nm for x in ['auth','session','login','token','aspx','.aspnet']):
+                    유지 += 1
+                else:
+                    드라이버.delete_cookie(c['name'])
+                    삭제 += 1
+            print(f"  쿠키: {삭제}개 삭제, {유지}개 유지")
+        except Exception:
+            pass
+
         드라이버.get(f"{사이트}/Car/Data")
         time.sleep(5)
         for _ in range(3):
             alert_처리(드라이버)
             time.sleep(1)
-        # 페이지당 100건 설정만 다시
+
+        # 다시 전수 비우기 + 100건 + 검색
         드라이버.execute_script("""
-            var rowSel = document.querySelector('select[name="sbxPageRowCount"]');
-            if (rowSel) {
-                for (var i = 0; i < rowSel.options.length; i++) {
-                    if (parseInt(rowSel.options[i].value) >= 100) {
-                        rowSel.value = rowSel.options[i].value;
-                        break;
-                    }
+            var keep = ['PageNumber','PageRow','PageTCount','__RequestVerificationToken'];
+            document.querySelectorAll('input[type="text"]').forEach(function(i){ i.value=''; });
+            document.querySelectorAll('input[type="hidden"]').forEach(function(i){
+                if (i.name && keep.indexOf(i.name)===-1) i.value='';
+            });
+            document.querySelectorAll('select').forEach(function(s){
+                if (s.name && s.name!=='sbxPageRowCount') s.selectedIndex=0;
+            });
+            var rs = document.querySelector('select[name="sbxPageRowCount"]');
+            if (rs) {
+                for (var i=0; i<rs.options.length; i++) {
+                    if (parseInt(rs.options[i].value)>=100) { rs.value=rs.options[i].value; break; }
                 }
             }
         """)
@@ -760,7 +813,16 @@ def _검색_초기화(드라이버):
         time.sleep(5)
         alert_처리(드라이버)
 
-    rows = 드라이버.execute_script("return document.querySelectorAll('tr.uc_carcss').length")
+        상태3 = 드라이버.execute_script("""
+            return {
+                PTC: (typeof PageTCount !== 'undefined') ? PageTCount : 'N/A',
+                PR: (typeof PageRow !== 'undefined') ? PageRow : 'N/A',
+                rows: document.querySelectorAll('tr.uc_carcss').length
+            };
+        """)
+        rows = 상태3.get('rows', 0)
+        print(f"  [재시도] PageTCount={상태3.get('PTC')}, PageRow={상태3.get('PR')}, 행수={rows}")
+
     print(f"  검색 초기화 완료 (현재 {rows}건 표시)")
 
 
