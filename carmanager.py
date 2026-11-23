@@ -372,6 +372,10 @@ def 사라진_매물_처리(현재_차량번호들):
 def 브라우저_열기():
     옵션 = webdriver.ChromeOptions()
     옵션.add_argument("--lang=ko")
+    옵션.add_argument("--disable-blink-features=AutomationControlled")
+    옵션.add_argument("--no-sandbox")
+    옵션.add_argument("--disable-dev-shm-usage")
+    옵션.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
     if HEADLESS:
         옵션.add_argument("--headless=new")
         옵션.add_argument("--window-size=1920,1080")
@@ -385,6 +389,11 @@ def 브라우저_열기():
     드라이버 = webdriver.Chrome(service=서비스, options=옵션)
 
     드라이버.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": """
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        window.chrome = {runtime: {}};
+        Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+        Object.defineProperty(navigator, 'languages', {get: () => ['ko-KR', 'ko', 'en-US', 'en']});
+
         window.__captured = [];
 
         (function() {
@@ -684,6 +693,44 @@ def HTML에서_차량_추출(html):
 def _검색_초기화(드라이버, 아이디, 비밀번호):
     """검색 필터 초기화 + 페이지당 50건 설정"""
     print("  검색 조건 초기화 중...")
+    print(f"  현재 URL: {드라이버.current_url}")
+
+    페이지_정보 = 드라이버.execute_script("""
+        return {
+            url: location.href,
+            bodyLen: document.body ? document.body.innerText.length : 0,
+            formCount: document.querySelectorAll('form').length,
+            selectCount: document.querySelectorAll('select').length,
+            tableCount: document.querySelectorAll('table').length,
+            inputCount: document.querySelectorAll('input').length,
+            title: document.title,
+            readyState: document.readyState
+        };
+    """)
+    print(f"  [페이지] 제목={페이지_정보.get('title','?')}, 본문={페이지_정보.get('bodyLen',0)}자, "
+          f"form={페이지_정보.get('formCount',0)}, select={페이지_정보.get('selectCount',0)}, "
+          f"input={페이지_정보.get('inputCount',0)}, table={페이지_정보.get('tableCount',0)}")
+
+    if 페이지_정보.get('selectCount', 0) == 0:
+        print("  select 없음 → 10초 추가 대기...")
+        time.sleep(10)
+        재확인 = 드라이버.execute_script("""
+            return {
+                selectCount: document.querySelectorAll('select').length,
+                bodyLen: document.body ? document.body.innerText.length : 0
+            };
+        """)
+        print(f"  재확인: select={재확인.get('selectCount',0)}, 본문={재확인.get('bodyLen',0)}자")
+
+        if 재확인.get('selectCount', 0) == 0:
+            print("  여전히 select 없음 → 페이지 새로고침 시도...")
+            드라이버.refresh()
+            time.sleep(8)
+            for _ in range(3):
+                alert_처리(드라이버)
+                time.sleep(1)
+            새로고침_확인 = 드라이버.execute_script("return document.querySelectorAll('select').length;")
+            print(f"  새로고침 후: select={새로고침_확인}개")
 
     상태 = 드라이버.execute_script("""
         var r = {};
@@ -861,9 +908,23 @@ def 전체_수집(드라이버, 아이디, 비밀번호):
 
     _검색_초기화(드라이버, 아이디, 비밀번호)
 
+    소스 = 드라이버.page_source
     with open("페이지_소스.html", "w", encoding="utf-8") as f:
-        f.write(드라이버.page_source)
-    print("  페이지 소스 저장 완료 (페이지_소스.html)")
+        f.write(소스)
+    print(f"  페이지 소스 저장 완료 ({len(소스)}자)")
+
+    # 디버깅: 페이지에 uc_data 테이블이 있는지, form이 있는지
+    디버그 = 드라이버.execute_script("""
+        return {
+            hasUcData: !!document.querySelector('table.uc_data'),
+            hasForm: !!document.querySelector('form'),
+            formAction: document.querySelector('form') ? document.querySelector('form').action : 'none',
+            cookies: document.cookie.length,
+            webdriver: navigator.webdriver
+        };
+    """)
+    print(f"  [디버그] uc_data테이블={디버그.get('hasUcData')}, form={디버그.get('hasForm')}, "
+          f"쿠키길이={디버그.get('cookies')}, webdriver={디버그.get('webdriver')}")
 
     총_페이지 = _총_페이지_수(드라이버)
     if 최대_페이지 > 0:
