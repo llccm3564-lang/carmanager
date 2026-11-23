@@ -121,6 +121,12 @@ DB_파일 = "매물_데이터.db"
 상세_사진_배치 = 100  # 한 번에 상세 사진 수집할 차량 수
 세션_갱신_페이지 = 20  # N페이지마다 쿠키 날리고 재로그인 (봇 감지 방지)
 세션_갱신_상세 = 20  # 상세 N대마다 쿠키 날리고 재로그인
+
+# 수집 지역 고정 (계정 기본 단지를 무시하고 이 값으로 검색)
+# 103/1038/96502 = 인천 서구 / 엠파크타워 (11-19 옛 계정 페이지에서 확인)
+검색_시도 = os.getenv("CM_SIDO", "103")
+검색_지역 = os.getenv("CM_AREA", "1038")
+검색_단지 = os.getenv("CM_DANJI", "96502")
 HEADLESS = "--headless" in sys.argv
 
 # Supabase (.env 파일에서 읽음)
@@ -694,6 +700,34 @@ def HTML에서_차량_추출(html):
 # ════════════════════════════════════════════════════════════
 # 수집 엔진
 # ════════════════════════════════════════════════════════════
+def _지역_고정(드라이버):
+    """시도/지역/단지 hidden 값을 설정값으로 덮어쓰기 (계정 기본 단지 무시).
+    select change 이벤트가 hidden 을 되돌릴 수 있으니 select 처리 뒤, 제출 직전에 부른다."""
+    결과 = 드라이버.execute_script("""
+        var want = arguments[0];
+        var out = {};
+        Object.keys(want).forEach(function(name) {
+            var els = document.querySelectorAll('input[name="'+name+'"]');
+            if (els.length === 0) {
+                var f = document.querySelector('form');
+                if (f) {
+                    var el = document.createElement('input');
+                    el.type = 'hidden'; el.name = name; f.appendChild(el);
+                    els = [el];
+                }
+            }
+            els.forEach(function(el){ el.value = want[name]; });
+            out[name] = els.length;
+        });
+        return out;
+    """, {
+        "cbxSearchSiDo": 검색_시도,
+        "cbxSearchSiDoArea": 검색_지역,
+        "cbxSearchDanji": 검색_단지,
+    })
+    print(f"  지역 고정: 시도={검색_시도} 지역={검색_지역} 단지={검색_단지} (칸 {결과})")
+
+
 def _검색_초기화(드라이버, 아이디, 비밀번호):
     """검색 필터 초기화 + 페이지당 50건 설정"""
     print("  검색 조건 초기화 중...")
@@ -776,15 +810,6 @@ def _검색_초기화(드라이버, 아이디, 비밀번호):
     드라이버.execute_script("""
         document.querySelectorAll('input[type="text"]').forEach(function(i){ i.value=''; });
 
-        // 지역/단지 hidden 필드 초기화 (핵심: 이게 남아있으면 특정 지역만 검색됨)
-        var clearHiddens = ['cbxSearchDanji','cbxSearchSiDo','cbxSearchSiDoArea',
-                            'hdfDefaultCity','hdfDefaultDanji','hdfDefaultSido',
-                            'fristSetCity','fristSetSido'];
-        clearHiddens.forEach(function(name) {
-            var el = document.querySelector('input[name="'+name+'"]');
-            if (el) el.value = '';
-        });
-
         document.querySelectorAll('select').forEach(function(s){
             if (!s.name || s.name==='sbxPageRowCount') return;
             var found = false;
@@ -813,6 +838,7 @@ def _검색_초기화(드라이버, 아이디, 비밀번호):
         if (pr) pr.value = '50';
     """)
     time.sleep(1)
+    _지역_고정(드라이버)
 
     try:
         method = 드라이버.execute_script("""
@@ -881,6 +907,7 @@ def _검색_초기화(드라이버, 아이디, 비밀번호):
             if (pr) pr.value = '50';
         """)
         time.sleep(1)
+        _지역_고정(드라이버)
         try:
             드라이버.execute_script("""
                 if (typeof goFormSubmitType === 'function') goFormSubmitType();
@@ -962,6 +989,14 @@ def 전체_수집(드라이버, 아이디, 비밀번호):
             for _ in range(3):
                 alert_처리(드라이버)
                 time.sleep(1)
+            # 재로그인하면 계정 기본 단지로 돌아가므로 지역 다시 고정 + 50건 설정
+            드라이버.execute_script("""
+                var rs = document.querySelector('select[name="sbxPageRowCount"]');
+                if (rs) { for (var i=0;i<rs.options.length;i++){ if (rs.options[i].value==='50'){ rs.selectedIndex=i; break; } } }
+                var pr = document.querySelector('input[name="PageRow"]');
+                if (pr) pr.value = '50';
+            """)
+            _지역_고정(드라이버)
             print(f"  [{p:>4}/{총_페이지}] ", end="", flush=True)
 
         if p > 1:
