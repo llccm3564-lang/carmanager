@@ -23,7 +23,7 @@ import json
 import re
 import getpass
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urljoin
 
 from selenium import webdriver
@@ -65,8 +65,17 @@ class _Tee:
             except Exception:
                 pass
 
+# log.txt 는 이어 쓰기 (쉬고 끝나는 실행이 지난 실행 로그를 덮어쓰지 않게). 5MB 넘으면 log.txt.old 로 넘김.
+_로그_시작위치 = 0
 try:
-    _log_file = open(_log_path, "w", encoding="utf-8")
+    if os.path.exists(_log_path) and os.path.getsize(_log_path) > 5_000_000:
+        os.replace(_log_path, _log_path + ".old")
+    _로그_시작위치 = os.path.getsize(_log_path) if os.path.exists(_log_path) else 0
+except Exception:
+    pass
+
+try:
+    _log_file = open(_log_path, "a", encoding="utf-8")
     sys.stdout = _Tee(sys.__stdout__, _log_file)
     sys.stderr = _Tee(sys.__stderr__, _log_file)
 except Exception:
@@ -83,11 +92,17 @@ import threading
 
 _로그_실행ID = datetime.now().strftime("%m%d-%H%M%S")
 _로그_PC = os.environ.get("COMPUTERNAME", "unknown")
-_로그_위치 = 0          # log.txt 에서 이미 올린 바이트 위치
+_로그_위치 = _로그_시작위치  # log.txt 에서 이미 올린 바이트 위치 (이번 실행 시작 지점부터)
 _로그_순번 = 0
 _로그_마지막전송 = time.time()
 _로그_잠금 = threading.Lock()
 _로그_끝냄 = False
+
+
+def _로그_건너뛰기():
+    """쉬는 시간 등으로 바로 끝나는 실행은 Supabase 에 로그를 안 올림 (5분마다 빈 로그가 쌓이지 않게)."""
+    global _로그_끝냄
+    _로그_끝냄 = True
 
 
 def _로그_행_추가(내용, 끝=False):
@@ -216,10 +231,24 @@ except ImportError:
 DB_파일 = "매물_데이터.db"
 사진_폴더 = "사진"
 보고서_파일 = "매물_보고서.csv"
-최대_페이지 = 0  # 0 = 전체, 숫자 = 해당 페이지까지만
-상세_사진_배치 = 100  # 한 번에 상세 사진 수집할 차량 수
-세션_갱신_페이지 = 20  # N페이지마다 쿠키 날리고 재로그인 (봇 감지 방지)
-세션_갱신_상세 = 20  # 상세 N대마다 쿠키 날리고 재로그인
+최대_페이지 = 0  # 0 = 제한 없음 (실제 한도는 아래 한번_목록_페이지·하루_목록_페이지)
+상세_사진_배치 = 20  # (예전 이름) 한 번에 상세 받을 차량 수 = 한번_상세_대수
+# 실행 안에서 쿠키 지우고 다시 로그인하는 것은 끔 (11-23: 같은 계정 재로그인이 오히려 튐 → 0 = 안 함)
+세션_갱신_페이지 = 0
+세션_갱신_상세 = 0
+
+# ── 속도·양 (11-23 gkvlfrl 이용제한 뒤 정함: 목록 59페이지/25분 만에 막힘) ──
+한번_목록_페이지 = 7       # 실행 한 번에 목록 최대 7페이지 (350대)
+한번_상세_대수 = 20        # 실행 한 번에 상세 최대 20대
+하루_목록_페이지 = 20      # 하루 목록 최대 20페이지 (1,000대)
+하루_상세_대수 = 200       # 하루 상세 최대 200대
+목록_바퀴_간격_시간 = 48   # 한 지역 목록을 끝까지 다 훑으면 이틀 뒤에 다시
+대기_범위 = (20, 40)       # 목록 페이지 사이·상세 차 사이 랜덤 대기(초)
+실행_간격_분 = (30, 60)    # 실행 끝나고 다음 실행까지 랜덤(분). bat 은 5분마다 켜지만 이 시간 전엔 바로 쉬고 끝남
+쉬는_시간 = (1, 7)         # 01:00~06:59 는 안 돌림
+제한_문구 = ("사용이 제한", "이용제한", "보안 정책에 위배")
+중지_파일 = os.path.join(_script_dir, "중지.txt")          # 있으면 아무것도 안 함 (이용제한 감지 때 생김)
+실행상태_파일 = os.path.join(_script_dir, "실행상태.json")  # 다음 실행 가능 시각
 
 # 수집 지역 고정 (계정 기본 단지를 무시하고 이 값으로 검색)
 # 103/1038/96502 = 인천 서구 / 엠파크타워 (11-19 옛 계정 페이지에서 확인)
@@ -372,9 +401,26 @@ def DB_초기화():
             신규_건수 INTEGER,
             사라진_건수 INTEGER
         );
+
+        -- 하루에 사이트에 보낸 양 (하루 상한 지키기용)
+        CREATE TABLE IF NOT EXISTS 하루사용 (
+            날짜 TEXT PRIMARY KEY,
+            상세 INTEGER DEFAULT 0,
+            목록페이지 INTEGER DEFAULT 0,
+            로그인 INTEGER DEFAULT 0
+        );
+
+        -- 지역별 목록 진행 (몇 페이지까지 훑었는지, 마지막으로 끝까지 훑은 때)
+        CREATE TABLE IF NOT EXISTS 목록진행 (
+            지역키 TEXT PRIMARY KEY,
+            다음페이지 INTEGER,
+            바퀴시작 TEXT,
+            마지막완료 TEXT,
+            전체건수 INTEGER
+        );
     """)
     # 기존 DB에 없는 컬럼 추가
-    for col in ["사진URL들 TEXT", "성능기록부 TEXT"]:
+    for col in ["사진URL들 TEXT", "성능기록부 TEXT", "검색지역 TEXT"]:
         try:
             db.execute(f"ALTER TABLE 차량 ADD COLUMN {col}")
         except Exception:
@@ -586,10 +632,15 @@ def alert_처리(드라이버):
 
 
 def 로그인(드라이버, 아이디, 비밀번호):
+    하루사용_더하기("로그인")
     드라이버.get(f"{사이트}/User/Login")
-    time.sleep(3)
+    time.sleep(random.uniform(3, 6))
 
-    alert_처리(드라이버)
+    msg = alert_처리(드라이버)
+    if msg:
+        print(f"  알림: {msg}")
+        _제한_확인(msg, "로그인 페이지 알림")
+    _제한_확인(드라이버.page_source, "로그인 페이지")
 
     try:
         id_input = 드라이버.find_element(By.CSS_SELECTOR, 'input[placeholder="아이디"]')
@@ -618,11 +669,13 @@ def 로그인(드라이버, 아이디, 비밀번호):
     except Exception:
         pass
 
-    time.sleep(3)
+    time.sleep(random.uniform(4, 7))
 
     msg = alert_처리(드라이버)
     if msg:
         print(f"  알림: {msg}")
+        _제한_확인(msg, "로그인 뒤 알림")
+    _제한_확인(드라이버.page_source, "로그인 뒤 화면")
 
     if "/User/Login" in 드라이버.current_url:
         print("  로그인 실패 — 아이디/비밀번호를 확인하세요.")
@@ -1095,6 +1148,227 @@ def _검색_초기화(드라이버, 아이디, 비밀번호):
     print(f"  검색 초기화 완료 (현재 {rows}건 표시)")
 
 
+# ════════════════════════════════════════════════════════════
+# 이용제한 방지: 하루 상한 · 실행 간격 · 제한 화면 감지
+# ════════════════════════════════════════════════════════════
+class _이용제한감지(BaseException):
+    """제한 화면을 보면 던짐. Exception 이 아니라서 중간의 except Exception 에 안 잡히고 끝까지 올라감."""
+
+
+def _지금글():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _오늘():
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def 하루사용_읽기():
+    db = DB_연결()
+    try:
+        r = db.execute("SELECT 상세, 목록페이지, 로그인 FROM 하루사용 WHERE 날짜=?", (_오늘(),)).fetchone()
+    finally:
+        db.close()
+    return {"상세": r["상세"] if r else 0, "목록페이지": r["목록페이지"] if r else 0, "로그인": r["로그인"] if r else 0}
+
+
+def 하루사용_더하기(항목, n=1):
+    if 항목 not in ("상세", "목록페이지", "로그인"):
+        return
+    db = DB_연결()
+    try:
+        db.execute("INSERT OR IGNORE INTO 하루사용 (날짜) VALUES (?)", (_오늘(),))
+        db.execute(f"UPDATE 하루사용 SET {항목} = {항목} + ? WHERE 날짜=?", (n, _오늘()))
+        db.commit()
+    finally:
+        db.close()
+
+
+def _실행상태_읽기():
+    try:
+        with open(실행상태_파일, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _다음실행_정하기():
+    분 = random.uniform(*실행_간격_분)
+    다음 = datetime.now() + timedelta(minutes=분)
+    try:
+        상태 = _실행상태_읽기()
+        상태["다음실행"] = 다음.strftime("%Y-%m-%d %H:%M:%S")
+        상태["마지막실행끝"] = _지금글()
+        with open(실행상태_파일, "w", encoding="utf-8") as f:
+            json.dump(상태, f, ensure_ascii=False)
+        print(f"  다음 실행: {다음.strftime('%H:%M')} 이후 ({분:.0f}분 쉼)")
+    except Exception as e:
+        print(f"  다음 실행 시각 저장 실패: {e}")
+
+
+def _제한_확인(글, 어디):
+    """페이지·응답에 이용제한 문구가 있으면 중지.txt 를 만들고 _이용제한감지 를 던진다."""
+    if not 글:
+        return
+    걸린 = [k for k in 제한_문구 if k in 글]
+    if not 걸린:
+        return
+    # 「보안 정책에 위배」는 제한 화면에만 있는 문구 → 어디서든 멈춤.
+    # 「이용제한」「사용이 제한」은 차 광고 글에도 나올 수 있어서 짧은 화면(제한 화면은 404자였음)일 때만.
+    if "보안 정책에 위배" not in 글 and len(글) >= 5000:
+        return
+    i = 글.find(걸린[0])
+    조각 = " ".join(re.sub(r"<[^>]+>", " ", 글[max(0, i - 150): i + 400]).split())
+    print("\n  " + "!" * 60)
+    print(f"  [이용제한 감지] {어디}")
+    print(f"  화면 내용: {조각}")
+    print("  → 지금 바로 모두 멈춥니다. 휴대폰으로 온 주소로 이용제한을 푼 뒤")
+    print(f"    {중지_파일} 파일을 지우면 다시 돌아갑니다.")
+    print("  " + "!" * 60)
+    try:
+        with open(중지_파일, "w", encoding="utf-8") as f:
+            f.write(f"{_지금글()} 이용제한 감지 ({어디})\n{조각}\n\n"
+                    "이용제한을 푼 뒤 이 파일을 지우면 다시 돌아갑니다.\n")
+    except Exception:
+        pass
+    raise _이용제한감지(어디)
+
+
+def _지역키():
+    return f"{검색_시도}/{검색_지역}/{검색_단지}"
+
+
+def _목록진행_읽기(키=None):
+    """지역 목록 진행 상태. 처음이면 지금 DB 에 이미 받아 둔 차 수로 어디까지 했는지 추정해서 만든다."""
+    키 = 키 or _지역키()
+    db = DB_연결()
+    try:
+        r = db.execute("SELECT * FROM 목록진행 WHERE 지역키=?", (키,)).fetchone()
+        if r:
+            return dict(r)
+        # 처음: 새 형식(CarDetailEnc) 상세링크로 받아 둔 차 = 이 지역 목록에서 받은 차로 봄 (11-23 2,950대)
+        n, 최초 = db.execute(
+            "SELECT COUNT(*), MIN(최근확인) FROM 차량 WHERE 상세링크 LIKE '%CarDetailEnc%' AND 검색지역 IS NULL"
+        ).fetchone()
+        진행 = {"지역키": 키, "다음페이지": 1, "바퀴시작": None, "마지막완료": None, "전체건수": None}
+        if n and n >= 50:
+            db.execute("UPDATE 차량 SET 검색지역=? WHERE 상세링크 LIKE '%CarDetailEnc%' AND 검색지역 IS NULL", (키,))
+            진행["다음페이지"] = n // 50 + 1
+            진행["바퀴시작"] = 최초
+            print(f"  목록 진행 기록 처음 만듦: 이미 받은 {n}대 → {진행['다음페이지']}페이지부터 이어서")
+        db.execute("INSERT INTO 목록진행 (지역키, 다음페이지, 바퀴시작, 마지막완료, 전체건수) VALUES (?,?,?,?,?)",
+                   (키, 진행["다음페이지"], 진행["바퀴시작"], 진행["마지막완료"], 진행["전체건수"]))
+        db.commit()
+        return 진행
+    finally:
+        db.close()
+
+
+def _목록진행_쓰기(진행):
+    db = DB_연결()
+    try:
+        db.execute("UPDATE 목록진행 SET 다음페이지=?, 바퀴시작=?, 마지막완료=?, 전체건수=? WHERE 지역키=?",
+                   (진행.get("다음페이지"), 진행.get("바퀴시작"), 진행.get("마지막완료"),
+                    진행.get("전체건수"), 진행["지역키"]))
+        db.commit()
+    finally:
+        db.close()
+
+
+def 목록_할_차례():
+    """(할 차례인지, 이유). 한 바퀴 도는 중이면 이어서, 다 돌았으면 이틀 뒤에."""
+    진행 = _목록진행_읽기()
+    if 진행.get("바퀴시작"):
+        return True, f"{진행.get('다음페이지')}페이지부터 이어서"
+    마지막 = 진행.get("마지막완료")
+    if not 마지막:
+        return True, "처음"
+    다음 = datetime.strptime(마지막, "%Y-%m-%d %H:%M:%S") + timedelta(hours=목록_바퀴_간격_시간)
+    if datetime.now() >= 다음:
+        return True, "새 바퀴"
+    return False, f"마지막으로 끝까지 훑은 때 {마지막[:16]} → 다음 바퀴 {다음.strftime('%m-%d %H:%M')}"
+
+
+def DB_상세_대상(최대):
+    """상세(사진·내용·성능기록부)를 아직 안 받은 등록중 차. 최근에 목록에서 본 차부터."""
+    db = DB_연결()
+    try:
+        rows = db.execute("""
+            SELECT 차량번호, 차종, 상세링크, 원본데이터 FROM 차량
+            WHERE 상태='등록중' AND 상세링크 LIKE '%CarDetailEnc%'
+              AND (성능기록부 IS NULL OR 성능기록부 NOT LIKE ?)
+            ORDER BY 최근확인 DESC LIMIT ?
+        """, (f'%"detail_v": {상세_버전}%', max(1, 최대) * 3)).fetchall()
+    finally:
+        db.close()
+    대상 = []
+    for r in rows:
+        try:
+            차 = json.loads(r["원본데이터"] or "{}")
+        except Exception:
+            차 = {}
+        차["차량번호"] = r["차량번호"]
+        if not 차.get("encarno"):
+            m = re.search(r"encarno=([^&]+)", r["상세링크"] or "")
+            if m:
+                차["encarno"] = m.group(1)
+        차.setdefault("차종", r["차종"] or "?")
+        차.setdefault("상세링크", r["상세링크"])
+        if 차.get("encarno"):
+            대상.append(차)
+        if len(대상) >= 최대:
+            break
+    return 대상
+
+
+def 지역_사라짐_처리(키, 바퀴시작):
+    """한 바퀴를 끝까지 돌았을 때: 이 지역 차 중 이번 바퀴에서 한 번도 못 본 차 = 사라짐."""
+    지금 = _지금글()
+    db = DB_연결()
+    try:
+        ids = [r["차량번호"] for r in db.execute(
+            "SELECT 차량번호 FROM 차량 WHERE 상태='등록중' AND 검색지역=? AND (최근확인 IS NULL OR 최근확인 < ?)",
+            (키, 바퀴시작)).fetchall()]
+        for i in ids:
+            db.execute("UPDATE 차량 SET 상태='사라짐', 사라진날=? WHERE 차량번호=?", (지금, i))
+        db.commit()
+    finally:
+        db.close()
+    if supabase_client and ids:
+        try:
+            테이블 = supabase_client.table("car_listings")
+            for k in range(0, len(ids), 100):
+                테이블.update({"status": "removed", "removed_at": datetime.now().isoformat()}) \
+                    .in_("car_id", ids[k:k + 100]).execute()
+        except Exception as e:
+            print(f"  Supabase 사라짐 반영 실패: {str(e)[:80]}")
+    return len(ids)
+
+
+def _실행_해도_되나():
+    """(돌려도 되는지, 이유). 브라우저 열기 전에 판단 → 할 일 없으면 로그인도 안 함."""
+    if os.path.exists(중지_파일):
+        return False, f"중지.txt 있음 — 이용제한을 푼 뒤 {중지_파일} 를 지우면 다시 돌아요"
+    if HEADLESS:  # 자동 실행일 때만 시간 규칙 (손으로 켠 실행은 바로 돎)
+        시 = datetime.now().hour
+        if 쉬는_시간[0] <= 시 < 쉬는_시간[1]:
+            return False, f"밤 쉬는 시간 ({쉬는_시간[0]}~{쉬는_시간[1]}시)"
+        다음 = _실행상태_읽기().get("다음실행")
+        if 다음:
+            try:
+                if datetime.now() < datetime.strptime(다음, "%Y-%m-%d %H:%M:%S"):
+                    return False, f"다음 실행 {다음[11:16]} 이후"
+            except Exception:
+                pass
+    사용 = 하루사용_읽기()
+    상세_가능 = 사용["상세"] < 하루_상세_대수 and bool(DB_상세_대상(1))
+    목록_가능 = 사용["목록페이지"] < 하루_목록_페이지 and 목록_할_차례()[0]
+    if not 상세_가능 and not 목록_가능:
+        return False, (f"오늘 할 일 없음 (상세 {사용['상세']}/{하루_상세_대수}대, "
+                       f"목록 {사용['목록페이지']}/{하루_목록_페이지}페이지, 목록: {목록_할_차례()[1]})")
+    return True, ""
+
+
 def _목록_요청(드라이버, 페이지):
     """사이트 검색 버튼과 같은 요청을 직접 보낸다.
     (sCarData.js reLoadJsonCarDataMulti → POST /Car/DataPart, JSON {"para": {...}})
@@ -1107,7 +1381,9 @@ def _목록_요청(드라이버, 페이지):
         var para = {
             "EncCheck": val('EncCheck', ''), "PrePage": val('PrePage', '1'),
             "PageNow": page, "PageSize": "50",
-            "PageSort": val('sbxPageSort', '0'), "PageAscDesc": val('sbxPageAscDesc', '1'),
+            // 정렬 고정: 1=광고등록순, 0=오름차순(오래된 것부터). 새 매물은 뒤에 붙어서
+            // 여러 실행에 나눠 훑어도 이미 본 페이지가 덜 밀림 (매물수정순은 수정할 때마다 앞으로 튐)
+            "PageSort": "1", "PageAscDesc": "0",
             "CarMode": "0",
             "CarSiDoNo": sido, "CarSiDoAreaNo": area, "CarDanjiNo": danji,
             "CarMakerNo": null, "CarModelNo": null, "CarModelDetailNo": "", "CarGradeNo": "", "CarGradeDetailNo": "",
@@ -1147,75 +1423,66 @@ def _목록_페이지_열기(드라이버):
         msg = alert_처리(드라이버)
         if msg:
             print(f"  알림: {msg}")
-    time.sleep(3)
+            _제한_확인(msg, "매물조회 페이지 알림")
+    time.sleep(random.uniform(3, 6))
+    _제한_확인(드라이버.page_source, "매물조회 페이지")
     try:
         드라이버.set_script_timeout(60)
     except Exception:
         pass
 
 
-def 전체_수집(드라이버, 아이디, 비밀번호):
+def 목록_이어서(드라이버, 아이디, 비밀번호, 최대페이지):
+    """지역 목록을 지난번 멈춘 페이지부터 최대페이지 만큼만 훑는다 (한 페이지 겹쳐서 밀림 대비).
+    끝 페이지까지 다 돌면 그 바퀴에서 못 본 차를 사라짐 처리하고, 다음 바퀴는 목록_바퀴_간격_시간 뒤."""
     global 목록_완료, 목록_신규
     목록_완료 = False
     목록_신규 = 0
     전체 = []
     본_번호 = set()
+    키 = _지역키()
 
-    print("  매물조회 페이지 접속 중...")
-    가로챈_응답_비우기(드라이버)
-    _목록_페이지_열기(드라이버)
-    print(f"  수집 지역: 시도={검색_시도} 지역={검색_지역} 단지={검색_단지} (목록 요청 /Car/DataPart 직접)")
+    진행 = _목록진행_읽기(키)
+    if not 진행.get("바퀴시작"):
+        진행.update({"다음페이지": 1, "바퀴시작": _지금글()})
+        _목록진행_쓰기(진행)
+        print("  목록: 새 바퀴 시작 (1페이지부터)")
+    시작 = max(1, int(진행.get("다음페이지") or 1) - 1)
 
-    총_페이지 = None   # 첫 응답의 전체 건수로 정함. 못 찾으면 50대 미만 페이지가 나올 때까지
-    p = 1
-    while True:
+    if "/Car/Data" not in (드라이버.current_url or ""):
+        _목록_페이지_열기(드라이버)
+    print(f"  목록: 지역 {키} | {시작}페이지부터 최대 {최대페이지}페이지 "
+          f"(정렬: 광고등록 오래된 순, 대기 {대기_범위[0]}~{대기_범위[1]}초)")
+
+    총_페이지 = None
+    p = 시작
+    받은 = 0
+    while 받은 < 최대페이지:
         if 총_페이지 is not None and p > 총_페이지:
-            목록_완료 = True
             break
-        if 최대_페이지 > 0 and p > 최대_페이지:
-            break
-        if p > 1000:
-            print("  1000페이지 넘음 — 안전장치로 중단")
-            break
-
-        # 세션 갱신: N페이지마다 쿠키 날리고 재로그인 (봇 감지 방지)
-        if p > 1 and 세션_갱신_페이지 > 0 and (p - 1) % 세션_갱신_페이지 == 0:
-            갱신대기 = random.uniform(15, 30)
-            print(f"\n  [세션 갱신] 쿠키 초기화 + 재로그인 ({갱신대기:.0f}초 대기 후)...")
-            time.sleep(갱신대기)
-            드라이버.delete_all_cookies()
-            time.sleep(2)
-            if not 로그인(드라이버, 아이디, 비밀번호):
-                print("  재로그인 실패! 여기까지 모은 것만 저장")
-                break
-            _목록_페이지_열기(드라이버)
+        if 받은 > 0:
+            time.sleep(random.uniform(*대기_범위))
 
         print(f"  [{p:>4}/{총_페이지 or '?'}] ", end="", flush=True)
-
-        if p > 1:
-            대기 = random.uniform(8, 15)
-            if p % 10 == 0:
-                대기 = random.uniform(30, 60)
-                print(f"(쉬는 중 {대기:.0f}초) ", end="", flush=True)
-            time.sleep(대기)
-
         try:
             응답 = _목록_요청(드라이버, p)
         except Exception as e:
             alert_처리(드라이버)
             print(f"요청 실패 ({str(e)[:120]})")
             break
-        time.sleep(random.uniform(3, 6))  # 예전 화면 로딩 대기와 같은 간격 유지
-        alert_처리(드라이버)
+        하루사용_더하기("목록페이지")
+        time.sleep(random.uniform(3, 6))
+        msg = alert_처리(드라이버)
+        if msg:
+            _제한_확인(msg, f"목록 {p}페이지 알림")
 
         html = 응답.get("html", "") or ""
+        _제한_확인(html, f"목록 {p}페이지")
         if 응답.get("error") or 응답.get("status") != 200:
-            앞부분 = " ".join(html.split())[:800]
             print(f"요청 실패: 상태={응답.get('status')} 오류={응답.get('error')}")
-            print(f"  응답 앞부분: {앞부분}")
+            print(f"  응답 앞부분: {' '.join(html.split())[:800]}")
             break
 
-        # 응답 안 스크립트가 갱신하는 값: 전체 건수 / EncCheck
         건수 = (re.search(r"hdfCarRowCount[\"']?\)\.val\(\s*['\"](\d+)", html)
               or re.search(r"ui_totalcount[\"']?\)\.html\(\s*remakeNumber\(\s*['\"](\d+)", html)
               or re.search(r"reLoadPage\(\s*['\"](\d+)['\"]", html))
@@ -1223,56 +1490,67 @@ def 전체_수집(드라이버, 아이디, 비밀번호):
         if 새_enc and 새_enc.group(1) != 응답.get("enc"):
             드라이버.execute_script(
                 "var e=document.getElementById('EncCheck'); if(e) e.value=arguments[0];", 새_enc.group(1))
+        if 건수:
+            진행["전체건수"] = int(건수.group(1))
+            총_페이지 = max(1, -(-진행["전체건수"] // 50))
 
         차량들 = HTML에서_차량_추출(html)
-
-        if p == 1:
-            with open("페이지_소스.html", "w", encoding="utf-8") as f:
-                f.write(html)
-            전체건수 = int(건수.group(1)) if 건수 else None
+        if 받은 == 0:
             단지들 = sorted({(차.get("지역") or "")[:25] for 차 in 차량들})[:5]
-            print(f"\n  [첫 응답] 상태={응답.get('status')} 길이={len(html)} 전체건수={전체건수} "
-                  f"화면칸건수={응답.get('total')} 행={len(차량들)} 단지={단지들}")
-            print(f"  [첫 응답] 보낸 EncCheck={응답.get('sentEnc')} PrePage={응답.get('sentPre')} → "
-                  f"받은 뒤 EncCheck={응답.get('enc')} PrePage={응답.get('pre')} 적용오류={응답.get('applyError')}")
-            if 전체건수:
-                총_페이지 = max(1, -(-전체건수 // 50))
+            print(f"\n  [첫 응답] 상태={응답.get('status')} 길이={len(html)} 전체건수={진행.get('전체건수')} "
+                  f"총페이지={총_페이지} 행={len(차량들)} 단지={단지들}")
             if not 차량들:
                 print(f"  [첫 응답] 목록 없음 — 응답 앞부분: {' '.join(html.split())[:1500]}")
-            print(f"  수집 대상: {총_페이지 if 총_페이지 else '끝날 때까지'} 페이지")
             print(f"  [{p:>4}/{총_페이지 or '?'}] ", end="", flush=True)
 
         if not 차량들:
             print("데이터 없음")
-            if p > 1 and 총_페이지 is None:
-                목록_완료 = True
+            if p > 1:
+                목록_완료 = True  # 끝 페이지를 넘음
             break
 
         새것 = [차 for 차 in 차량들 if 차.get("차량번호") not in 본_번호]
-        if not 새것:
-            print("앞 페이지와 같은 목록 — 페이지 넘김이 안 됨, 중단")
-            break
         for 차 in 새것:
             본_번호.add(차.get("차량번호"))
         전체.extend(새것)
 
-        # 페이지마다 바로 저장 (중간에 꺼져도 여기까지 훑은 차는 남음)
+        # 페이지마다 바로 저장 + 이 지역 표시 + 진행 기록
         저장메모 = ""
         try:
             이번신규 = 차량_저장(새것)
             목록_신규 += 이번신규
+            db = DB_연결()
+            db.executemany("UPDATE 차량 SET 검색지역=? WHERE 차량번호=?",
+                           [(키, 차["차량번호"]) for 차 in 새것 if 차.get("차량번호")])
+            db.commit()
+            db.close()
             Supabase_차량_저장(새것)
             if 이번신규:
                 저장메모 = f" (신규 {이번신규})"
         except Exception as e:
             저장메모 = f" (저장 오류: {str(e)[:60]})"
-        print(f"{len(새것):>3}대 추출{저장메모}")
+        진행["다음페이지"] = p + 1
+        _목록진행_쓰기(진행)
+        print(f"{len(새것):>3}대{저장메모}")
 
-        if 총_페이지 is None and len(차량들) < 50:
+        if len(차량들) < 50:
             목록_완료 = True
             break
         p += 1
+        받은 += 1
 
+    if 총_페이지 is not None and p > 총_페이지:
+        목록_완료 = True
+
+    if 목록_완료:
+        사라진 = 지역_사라짐_처리(키, 진행["바퀴시작"])
+        print(f"\n  목록 한 바퀴 끝 (전체 {진행.get('전체건수')}대). 이번 바퀴에서 못 본 차 {사라진}대 → 사라짐")
+        진행.update({"다음페이지": 1, "바퀴시작": None, "마지막완료": _지금글()})
+        _목록진행_쓰기(진행)
+        print(f"  다음 바퀴는 {목록_바퀴_간격_시간}시간 뒤")
+    else:
+        print(f"\n  목록: 이번엔 여기까지. 다음 실행에 {진행.get('다음페이지')}페이지부터 이어서"
+              + (f" (전체 {총_페이지}페이지)" if 총_페이지 else ""))
     return 전체
 
 
@@ -1373,8 +1651,9 @@ def _성능기록부_가져오기(주소, 상세주소=""):
         return {"url": 주소, "error": str(e)[:200]}
 
 
-def 상세_사진_수집(드라이버, 차량_목록):
-    """각 차량 상세 페이지에서 사진 여러 장 수집 (배치 단위)"""
+def 상세_사진_수집(드라이버, 차량_목록, 최대=None):
+    """각 차량 상세 페이지에서 사진 전체·내용·성능기록부 수집 (최대 대수만큼)"""
+    최대 = 한번_상세_대수 if 최대 is None else 최대
 
     # 이미 상세를 끝낸 차량 제외
     # 기준 = 지금 방식으로 상세(사진+내용+성능기록부)를 받아 「완료표시」가 저장된 차.
@@ -1392,28 +1671,24 @@ def 상세_사진_수집(드라이버, 차량_목록):
 
     대상 = [차 for 차 in 차량_목록 if 차.get("encarno") and 차.get("차량번호") not in 수집완료]
 
+    if not 대상 or 최대 <= 0:
+        print("\n  상세: 할 차 없음 (건너뜀)")
+        return
+
     # 상세 요청에는 목록 페이지의 EncCheck 값이 필요하다 → 목록 페이지에 있어야 함
     try:
         드라이버.set_script_timeout(40)
-        if "/Car/Data" not in (드라이버.current_url or ""):
-            드라이버.get(f"{사이트}/Car/Data")
-            time.sleep(5)
-            for _ in range(3):
-                alert_처리(드라이버)
-                time.sleep(1)
     except Exception:
         pass
+    if "/Car/Data" not in (드라이버.current_url or ""):
+        _목록_페이지_열기(드라이버)  # 이용제한 화면이면 여기서 멈춤
 
-    if not 대상:
-        print("\n  상세 사진: 모든 차량 수집 완료 (건너뜀)")
-        return
-
-    배치 = 대상[:상세_사진_배치]
-    남은 = len(대상) - len(배치)
-    print(f"\n  상세 사진 수집: {len(배치)}대 (미수집 {len(대상)}대 중, 나머지 {남은}대는 다음 실행)")
+    배치 = 대상[:최대]
+    print(f"\n  상세 수집: {len(배치)}대 (차 사이 {대기_범위[0]}~{대기_범위[1]}초)")
 
     수집_성공 = 0
     총_장수 = 0
+    연속_이상 = 0
 
     for i, 차 in enumerate(배치):
         링크 = 차.get("상세링크", "")
@@ -1445,14 +1720,9 @@ def 상세_사진_수집(드라이버, 차량_목록):
                 print("  .env에 계정 없음 — 상세 수집 중단...")
                 break
 
-        print(f"  [{i+1:>4}/{len(배치)}] {차종:20s} ", end="", flush=True)
-
         if i > 0:
-            대기 = random.uniform(5, 10)
-            if (i + 1) % 20 == 0:
-                대기 = random.uniform(30, 60)
-                print(f"(쉬는 중 {대기:.0f}초) ", end="", flush=True)
-            time.sleep(대기)
+            time.sleep(random.uniform(*대기_범위))
+        print(f"  [{i+1:>4}/{len(배치)}] {차종:20s} ", end="", flush=True)
 
         try:
             # 상세 = /PopupFrame/CarDetailEnc/ 에 encarno + EncCheck POST (사이트 default.js 와 같은 방식)
@@ -1530,6 +1800,11 @@ def 상세_사진_수집(드라이버, 차량_목록):
                     perf.perfSection = best.substring(0, 2000);
 
                     var out = {status: res.status, len: res.html.length, photos: photos, perf: perf};
+                    // 이용제한 확인용: 짧은 응답은 본문을, 긴 응답은 제한 문구가 있을 때 그 앞뒤만
+                    var bodyText = (doc.body ? doc.body.textContent : res.html).replace(/\\s+/g, ' ').trim();
+                    var pk = res.html.indexOf('보안 정책에 위배');
+                    if (res.html.length < 5000) out.head = bodyText.substring(0, 600);
+                    else if (pk >= 0) out.head = res.html.substring(Math.max(0, pk - 200), pk + 400);
                     if (dump) {
                         out.title = doc.title;
                         out.text = (doc.body ? doc.body.textContent : '').replace(/\\s+/g, ' ').substring(0, 1500);
@@ -1541,8 +1816,12 @@ def 상세_사진_수집(드라이버, 차량_목록):
                     done(out);
                 }).catch(function(e){ done({error: String(e)}); });
             """, 차.get("encarno", ""), i == 0) or {}
+            하루사용_더하기("상세")
             time.sleep(random.uniform(3, 6))  # 예전 화면 로딩 대기와 같은 간격 유지
-            alert_처리(드라이버)
+            msg = alert_처리(드라이버)
+            if msg:
+                _제한_확인(msg, f"상세 {i+1}번째 알림")
+            _제한_확인(상세.get("head") or "", f"상세 {i+1}번째 ({차종})")
 
             if 상세.get("error"):
                 raise Exception(상세["error"])
@@ -1590,6 +1869,7 @@ def 상세_사진_수집(드라이버, 차량_목록):
             # 상세 응답을 정상으로 받았고 기록부 요청도 실패하지 않았으면 「완료표시」 → 다음 실행부터 건너뜀
             # (사진이 원래 없는 차도 여기서 끝. 실패한 차는 표시 안 해서 다음 실행에 다시 시도)
             정상응답 = 상세.get("status") == 200 and (상세.get("len") or 0) > 1000
+            연속_이상 = 0 if 정상응답 else 연속_이상 + 1
             if 정상응답 and not 기록.get("error"):
                 성능["detail_v"] = 상세_버전
                 성능["fetched_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1623,15 +1903,20 @@ def 상세_사진_수집(드라이버, 차량_목록):
                         pass
             else:
                 print(f"상세 응답 이상 (상태={상세.get('status')} 길이={상세.get('len')}) — 다음 실행에 다시")
+                if 상세.get("head"):
+                    print(f"    응답 내용: {상세['head'][:300]}")
 
         except Exception as e:
             차["사진URL들"] = []
             차["성능기록부"] = {}
+            연속_이상 += 1
             print(f"실패 ({str(e)[:50]})")
 
-    print(f"\n  상세 사진 완료: {수집_성공}대에서 총 {총_장수}장 수집")
-    if 남은 > 0:
-        print(f"  남은 {남은}대는 다음 실행에서 계속")
+        if 연속_이상 >= 3:
+            print("  상세가 3번 연속 이상해서 이번 실행의 상세는 여기서 멈춤")
+            break
+
+    print(f"\n  상세 완료: {수집_성공}대에서 사진 총 {총_장수}장")
 
 
 # ════════════════════════════════════════════════════════════
@@ -1680,6 +1965,7 @@ def 사진_다운로드(차량_목록):
                     다운 += 1
             except Exception:
                 실패 += 1
+            time.sleep(random.uniform(0.3, 0.8))  # 사진 서버에 한꺼번에 몰리지 않게
 
     return 다운, 실패
 
@@ -1725,14 +2011,27 @@ def 보고서_생성():
 # 메인
 # ════════════════════════════════════════════════════════════
 def 메인():
+    # 0) 돌려도 되는지 먼저 (브라우저·로그인 전에). 안 되면 로그도 안 올리고 바로 끝.
+    DB_초기화()
+    됨, 이유 = _실행_해도_되나()
+    if not 됨:
+        print(f"  [{datetime.now().strftime('%m-%d %H:%M')} 쉼] {이유}")
+        _로그_건너뛰기()
+        return
+
     print()
+    print(f"  ===== 실행 시작 {_지금글()} =====")
     print("  ┌────────────────────────────────────┐")
     print("  │     카매니저 매물 확인 프로그램      │")
     print("  ├────────────────────────────────────┤")
-    print("  │  - 전체 매물 정보 수집              │")
-    print("  │  - 차량 사진 다운로드 (여러 장)      │")
-    print("  │  - 사라진 매물 자동 감지            │")
+    print("  │  - 상세(사진·내용·성능기록부) 먼저   │")
+    print("  │  - 목록은 이어서 조금씩, 이틀에 한 바퀴│")
+    print("  │  - 이용제한 화면 보이면 바로 멈춤    │")
     print("  └────────────────────────────────────┘")
+    사용 = 하루사용_읽기()
+    print(f"  오늘 쓴 양: 상세 {사용['상세']}/{하루_상세_대수}대 · 목록 {사용['목록페이지']}/{하루_목록_페이지}페이지 · "
+          f"로그인 {사용['로그인']}번")
+    print(f"  이번 한도: 상세 {한번_상세_대수}대 · 목록 {한번_목록_페이지}페이지 · 대기 {대기_범위[0]}~{대기_범위[1]}초")
     print()
 
     # 아이디/비번 — 환경변수 우선, 없으면 직접 입력
@@ -1751,72 +2050,73 @@ def 메인():
         print("  아이디와 비밀번호를 입력해주세요.")
         return
 
-    DB_초기화()
     Supabase_초기화()
 
     print("\n  브라우저 여는 중..." + (" (헤드리스)" if HEADLESS else ""))
     드라이버 = 브라우저_열기()
 
+    차량_목록 = []
+    상세대상 = []
     try:
         print("  카매니저 로그인 중...")
         if not 로그인(드라이버, 아이디, 비밀번호):
             return
 
-        차량_목록 = 전체_수집(드라이버, 아이디, 비밀번호)
-
-        if not 차량_목록:
-            print("\n  차량 데이터를 추출하지 못했습니다.")
-            print("  '페이지_소스.html' 파일을 확인해주세요.")
-            if not HEADLESS:
-                input("\n  엔터를 누르면 종료...")
-            return
-
-        print(f"\n  === 수집 완료: {len(차량_목록)}대 ===")
-
-        # 저장은 목록 페이지마다 이미 함 → 여기선 사라진 매물 처리만 (로컬 + Supabase)
-        신규 = 목록_신규
-        번호들 = [차["차량번호"] for 차 in 차량_목록 if 차.get("차량번호")]
-        if 목록_완료:
-            사라진 = 사라진_매물_처리(번호들)
-            Supabase_사라진_처리(번호들)
+        # 1) 상세 먼저 — DB 에 있는 등록중 차 중 아직 안 받은 차
+        사용 = 하루사용_읽기()
+        남은상세 = min(한번_상세_대수, 하루_상세_대수 - 사용["상세"])
+        if 남은상세 > 0:
+            상세대상 = DB_상세_대상(남은상세)
+            if 상세대상:
+                상세_사진_수집(드라이버, 상세대상, 남은상세)
+            else:
+                print("\n  상세: 남은 차 없음")
         else:
-            사라진 = 0
-            print("  목록을 끝까지 못 받아서 이번엔 「사라짐」 처리를 건너뜀")
+            print(f"\n  상세: 오늘 상한 {하루_상세_대수}대 다 씀")
 
-        print(f"  신규 등록: {신규}대")
-        if 사라진 > 0:
-            print(f"  사라진 매물: {사라진}대 (팔렸거나 내려감)")
+        # 2) 목록 — 한 바퀴 도는 중이면 이어서, 다 돌았으면 이틀 뒤
+        사용 = 하루사용_읽기()
+        남은목록 = min(한번_목록_페이지, 하루_목록_페이지 - 사용["목록페이지"])
+        차례, 차례이유 = 목록_할_차례()
+        if 남은목록 > 0 and 차례:
+            if 상세대상:
+                time.sleep(random.uniform(*대기_범위))  # 상세와 목록 사이도 사람처럼 쉼
+            print(f"\n  목록: {차례이유}")
+            차량_목록 = 목록_이어서(드라이버, 아이디, 비밀번호, 남은목록)
+            print(f"  목록: 이번에 {len(차량_목록)}대 확인, 신규 {목록_신규}대")
+        elif not 차례:
+            print(f"\n  목록: 쉼 — {차례이유}")
+        else:
+            print(f"\n  목록: 오늘 상한 {하루_목록_페이지}페이지 다 씀")
 
-        # 상세 사진 수집 (차량별 여러 장, 배치 단위)
-        상세_사진_수집(드라이버, 차량_목록)
-
-        # 사진 다운로드
-        print("\n  사진 다운로드 중...")
-        다운, 실패 = 사진_다운로드(차량_목록)
-        print(f"  다운로드: {다운}장" + (f" (실패 {실패}건)" if 실패 else ""))
+        # 3) 사진 다운로드 (상세에서 받은 사진 여러 장 + 목록 대표 사진)
+        받을것 = 상세대상 + 차량_목록
+        if 받을것:
+            print("\n  사진 다운로드 중...")
+            다운, 실패 = 사진_다운로드(받을것)
+            print(f"  다운로드: {다운}장" + (f" (실패 {실패}건)" if 실패 else ""))
 
         # 수집 기록
         db = DB_연결()
         db.execute(
             "INSERT INTO 수집기록 (시각,수집_건수,신규_건수,사라진_건수) VALUES (?,?,?,?)",
-            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), len(차량_목록), 신규, 사라진)
+            (_지금글(), len(차량_목록), 목록_신규, 0)
         )
         db.commit()
         db.close()
 
-        # 보고서
         보고서_생성()
 
-        # 샘플 출력
-        print("\n  --- 최근 수집 샘플 (최대 5대) ---")
-        for 차 in 차량_목록[:5]:
-            사진수 = len(차.get("사진URL들", []))
-            print(f"  {차.get('차종','?'):20s}  {차.get('가격','?'):>10s}"
-                  f"  {차.get('연식','?'):>6s}  {차.get('주행거리','?'):>10s}"
-                  f"  {차.get('지역','?')}  사진:{사진수}장")
-
+    except _이용제한감지 as e:
+        print(f"\n  이용제한 감지로 멈춤 ({e}). 중지.txt 가 생겨서 다음 실행부터는 아무것도 안 합니다.")
     finally:
-        드라이버.quit()
+        try:
+            드라이버.quit()
+        except Exception:
+            pass
+        _다음실행_정하기()
+        사용 = 하루사용_읽기()
+        print(f"  오늘 누적: 상세 {사용['상세']}대 · 목록 {사용['목록페이지']}페이지 · 로그인 {사용['로그인']}번")
 
     print("\n  완료!")
     if not HEADLESS:

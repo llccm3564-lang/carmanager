@@ -7,3 +7,6 @@ __pycache__/
 API_응답.json
 매물_보고서.csv
 log.txt
+중지.txt
+실행상태.json
+log.txt.old
