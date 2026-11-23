@@ -648,10 +648,13 @@ def HTML에서_차량_추출(html):
         차["차종"] = f"{제조사} {모델명}".strip()
 
         if model_a:
-            onclick = model_a.get("onclick", "") or ""
-            m = re.search(r"['\"]([A-Za-z0-9+/=]{10,})['\"]", onclick)
+            # 실제 형태: href="javascript:carmangerDetailWindowPopUp_CHECK('Bb654c...==')"
+            # → 상세는 /PopupFrame/CarDetailEnc/ 에 encarno + EncCheck 를 POST (default.js)
+            링크원문 = (model_a.get("href", "") or "") + " " + (model_a.get("onclick", "") or "")
+            m = re.search(r"['\"]([A-Za-z0-9+/=]{10,})['\"]", 링크원문)
             if m:
-                차["상세링크"] = f"{사이트}/Car/Detail/{m.group(1)}"
+                차["encarno"] = m.group(1)
+                차["상세링크"] = f"{사이트}/PopupFrame/CarDetailEnc/?encarno={m.group(1)}"
 
         reg = row.select_one("span.uc_carreg")
         if reg:
@@ -701,11 +704,53 @@ def HTML에서_차량_추출(html):
 # 수집 엔진
 # ════════════════════════════════════════════════════════════
 def _지역_고정(드라이버):
-    """시도/지역/단지 hidden 값을 설정값으로 덮어쓰기 (계정 기본 단지 무시).
-    select change 이벤트가 hidden 을 되돌릴 수 있으니 select 처리 뒤, 제출 직전에 부른다."""
+    """검색 지역을 설정값으로 고정 (계정 기본 단지 무시). 제출 직전에 부른다.
+
+    사이트 검색 함수(sCarData.js reLoadJsonCarDataMulti)는 hidden 칸이 아니라
+    여러 개 고르기 상자 #searchSiDo_multi / #searchSiDoArea_multi 값으로 시도·지역을 정하고,
+    단지만 hidden #cbxSearchDanji 를 읽는다. 상자 플러그인은 jq351(jQuery 3.5.1)에 붙어 있다.
+    """
+    상자 = 드라이버.execute_script("""
+        var want = {'searchSiDo_multi': arguments[0], 'searchSiDoArea_multi': arguments[1],
+                    'searchDanji_multi': arguments[2]};
+        var out = {};
+        var jq = window.jq351 || window.jQuery;
+        Object.keys(want).forEach(function(id) {
+            var sel = document.getElementById(id);
+            if (!sel) { out[id] = '상자없음'; return; }
+            var v = want[id];
+            var has = false;
+            for (var i = 0; i < sel.options.length; i++) {
+                var o = sel.options[i];
+                o.selected = (o.value === v);
+                if (o.value === v) has = true;
+            }
+            if (!has) {
+                var op = document.createElement('option');
+                op.value = v; op.text = v; op.selected = true;
+                sel.appendChild(op);
+            }
+            try {
+                if (jq && jq(sel).multipleSelect) {
+                    jq(sel).multipleSelect('refresh');
+                    jq(sel).multipleSelect('setSelects', [v]);
+                }
+            } catch (e) { out[id + '_오류'] = String(e).substring(0, 80); }
+            var now = jq ? jq(sel).val() : null;
+            out[id] = (has ? '' : '(옵션추가)') + JSON.stringify(now);
+        });
+        return out;
+    """, 검색_시도, 검색_지역, 검색_단지)
+    print(f"  지역 상자: {상자}")
+
     결과 = 드라이버.execute_script("""
         var want = arguments[0];
         var out = {};
+        ['hdfDefaultSido','hdfDefaultCity','hdfDefaultDanji'].forEach(function(n){
+            var el = document.querySelector('input[name="'+n+'"]');
+            if (el) el.value = want[n];
+        });
+        delete want.hdfDefaultSido; delete want.hdfDefaultCity; delete want.hdfDefaultDanji;
         Object.keys(want).forEach(function(name) {
             var els = document.querySelectorAll('input[name="'+name+'"]');
             if (els.length === 0) {
@@ -724,6 +769,9 @@ def _지역_고정(드라이버):
         "cbxSearchSiDo": 검색_시도,
         "cbxSearchSiDoArea": 검색_지역,
         "cbxSearchDanji": 검색_단지,
+        "hdfDefaultSido": 검색_시도,
+        "hdfDefaultCity": 검색_지역,
+        "hdfDefaultDanji": 검색_단지,
     })
     print(f"  지역 고정: 시도={검색_시도} 지역={검색_지역} 단지={검색_단지} (칸 {결과})")
 
@@ -863,6 +911,18 @@ def _검색_초기화(드라이버, 아이디, 비밀번호):
         r.PR = (typeof PageRow !== 'undefined') ? PageRow : 'N/A';
         r.rows = document.querySelectorAll('tr.uc_carcss').length;
         r.url = location.href;
+        var jq = window.jq351 || window.jQuery;
+        r.multi = {};
+        ['searchSiDo_multi','searchSiDoArea_multi','searchDanji_multi'].forEach(function(id){
+            var el = document.getElementById(id);
+            r.multi[id] = el && jq ? JSON.stringify(jq(el).val()) : '없음';
+        });
+        var areas = [];
+        document.querySelectorAll('tr.uc_carcss .uc_cararea').forEach(function(td){
+            var t = td.innerText.split('\\n')[0].trim();
+            if (areas.indexOf(t) < 0) areas.push(t);
+        });
+        r.areas = areas.slice(0, 5);
         var h = {};
         document.querySelectorAll('input[type="hidden"]').forEach(function(i){
             if (i.name && i.value) h[i.name] = i.value;
@@ -874,6 +934,7 @@ def _검색_초기화(드라이버, 아이디, 비밀번호):
     print(f"  [후] PageTCount={상태2.get('PTC')}, PageRow={상태2.get('PR')}, 행수={rows}")
     if 상태2.get('h'):
         print(f"  [후] hidden: {상태2['h']}")
+    print(f"  [후] 지역 상자: {상태2.get('multi')} | 목록 단지: {상태2.get('areas')}")
 
     if rows == 0:
         print("  0건 → 쿠키 삭제 후 재로그인...")
@@ -1100,7 +1161,19 @@ def 상세_사진_수집(드라이버, 차량_목록):
         pass
     db.close()
 
-    대상 = [차 for 차 in 차량_목록 if 차.get("상세링크") and 차.get("차량번호") not in 수집완료]
+    대상 = [차 for 차 in 차량_목록 if 차.get("encarno") and 차.get("차량번호") not in 수집완료]
+
+    # 상세 요청에는 목록 페이지의 EncCheck 값이 필요하다 → 목록 페이지에 있어야 함
+    try:
+        드라이버.set_script_timeout(40)
+        if "/Car/Data" not in (드라이버.current_url or ""):
+            드라이버.get(f"{사이트}/Car/Data")
+            time.sleep(5)
+            for _ in range(3):
+                alert_처리(드라이버)
+                time.sleep(1)
+    except Exception:
+        pass
 
     if not 대상:
         print("\n  상세 사진: 모든 차량 수집 완료 (건너뜀)")
@@ -1133,6 +1206,12 @@ def 상세_사진_수집(드라이버, 차량_목록):
                 if not 로그인(드라이버, 아이디, 비밀번호):
                     print("  재로그인 실패! 상세 수집 중단...")
                     break
+                # 새 세션의 EncCheck 를 받으려고 목록 페이지를 다시 연다
+                드라이버.get(f"{사이트}/Car/Data")
+                time.sleep(5)
+                for _ in range(3):
+                    alert_처리(드라이버)
+                    time.sleep(1)
             else:
                 print("  .env에 계정 없음 — 상세 수집 중단...")
                 break
@@ -1147,105 +1226,109 @@ def 상세_사진_수집(드라이버, 차량_목록):
             time.sleep(대기)
 
         try:
-            드라이버.get(링크)
-            time.sleep(random.uniform(3, 6))
-            alert_처리(드라이버)
+            # 상세 = /PopupFrame/CarDetailEnc/ 에 encarno + EncCheck POST (사이트 default.js 와 같은 방식)
+            # 팝업 창을 띄우지 않고 목록 페이지 안에서 요청만 보내 HTML 을 받아 해석한다.
+            상세 = 드라이버.execute_async_script("""
+                var encarno = arguments[0], dump = arguments[1], done = arguments[arguments.length - 1];
+                var encEl = document.getElementById('EncCheck') || document.querySelector('input[name="EncCheck"]');
+                var body = 'encarno=' + encodeURIComponent(encarno) +
+                           '&EncCheck=' + encodeURIComponent(encEl ? encEl.value.trim() : '');
+                fetch('/PopupFrame/CarDetailEnc/', {
+                    method: 'POST', credentials: 'include',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: body
+                }).then(function(r){ return r.text().then(function(t){ return {status: r.status, url: r.url, html: t}; }); })
+                .then(function(res) {
+                    var doc = new DOMParser().parseFromString(res.html, 'text/html');
+                    var abs = function(u){ try { return new URL(u, location.origin + '/PopupFrame/CarDetailEnc/').href; } catch(e){ return u; } };
+                    var photos = [], seen = {};
+                    var add = function(u) {
+                        if (!u) return;
+                        u = abs(u);
+                        if (u.indexOf('noimage') !== -1 || seen[u]) return;
+                        if (!/\\.(jpe?g|png|webp|gif)(\\?|$)/i.test(u)) return;
+                        if (!/\\/(photo|Photo|Upload|CarPhoto)\\//.test(u) && u.indexOf('img.carmanager.co.kr') === -1) return;
+                        if (/logo|icon|btn_|bg_|banner|footer/i.test(u)) return;
+                        seen[u] = true; photos.push(u);
+                    };
+                    doc.querySelectorAll('img').forEach(function(img){
+                        add(img.getAttribute('src')); add(img.getAttribute('data-src'));
+                        add(img.getAttribute('data-original')); add(img.getAttribute('data-large'));
+                    });
+                    doc.querySelectorAll('a[href]').forEach(function(a){ add(a.getAttribute('href')); });
+                    doc.querySelectorAll('[style*="url("]').forEach(function(el){
+                        var m = (el.getAttribute('style') || '').match(/url\\(['"]?(.*?)['"]?\\)/);
+                        if (m) add(m[1]);
+                    });
+                    // 스크립트 안에 사진 주소가 들어 있는 경우(슬라이드 등)
+                    var raw = res.html.match(/https?:[^"'\\s<>]+?\\.(?:jpe?g|png|webp)/gi) || [];
+                    raw.forEach(add);
 
-            사진들 = 드라이버.execute_script("""
-                var photos = [];
-                var seen = {};
-
-                document.querySelectorAll('img').forEach(function(img) {
-                    var src = img.src || img.getAttribute('data-src') || img.getAttribute('data-original') || '';
-                    if (!src || src.indexOf('noimage') !== -1) return;
-                    if (src.indexOf('logo') !== -1 || src.indexOf('icon') !== -1) return;
-                    if (src.indexOf('btn_') !== -1 || src.indexOf('bg_') !== -1) return;
-                    if (src.indexOf('banner') !== -1 || src.indexOf('footer') !== -1) return;
-                    if (src.indexOf('/Upload/') !== -1 || src.indexOf('/CarPhoto/') !== -1 ||
-                        src.indexOf('/photo/') !== -1 || src.indexOf('/Photo/') !== -1 ||
-                        src.indexOf('/img/car') !== -1 || src.indexOf('/images/car') !== -1) {
-                        if (!seen[src]) { seen[src] = true; photos.push(src); }
-                    }
-                    else if (img.naturalWidth > 150 && img.naturalHeight > 100) {
-                        if (!seen[src]) { seen[src] = true; photos.push(src); }
-                    }
-                });
-
-                document.querySelectorAll('a[href]').forEach(function(a) {
-                    var href = a.href || '';
-                    if (href.match(/\\.(jpg|jpeg|png|webp|gif)/i) &&
-                        (href.indexOf('/Upload/') !== -1 || href.indexOf('/CarPhoto/') !== -1 ||
-                         href.indexOf('/photo/') !== -1 || href.indexOf('/Photo/') !== -1)) {
-                        if (!seen[href]) { seen[href] = true; photos.push(href); }
-                    }
-                });
-
-                document.querySelectorAll('[style*="background"]').forEach(function(el) {
-                    var style = window.getComputedStyle(el).backgroundImage || el.style.backgroundImage || '';
-                    var m = style.match(/url\\(['"]?(.*?)['"]?\\)/);
-                    if (m && m[1]) {
-                        var src = m[1];
-                        if (src.indexOf('noimage') === -1 && !seen[src] &&
-                            (src.indexOf('/Upload/') !== -1 || src.indexOf('/CarPhoto/') !== -1 ||
-                             src.indexOf('/photo/') !== -1 || src.indexOf('/Photo/') !== -1)) {
-                            seen[src] = true;
-                            photos.push(src);
-                        }
-                    }
-                });
-
-                return photos;
-            """) or []
-
-            # 성능기록부 추출
-            성능 = 드라이버.execute_script("""
-                var result = {links: [], info: {}, perfSection: ''};
-
-                document.querySelectorAll('a, button').forEach(function(el) {
-                    var text = (el.innerText || '').trim();
-                    var href = el.href || el.getAttribute('onclick') || '';
-                    if (text.indexOf('성능') !== -1 || text.indexOf('점검') !== -1 ||
-                        text.indexOf('진단') !== -1 || text.indexOf('이력') !== -1 ||
-                        href.indexOf('erform') !== -1 || href.indexOf('nspect') !== -1) {
-                        result.links.push({text: text.substring(0,50), href: href.substring(0,200)});
-                    }
-                });
-
-                document.querySelectorAll('table').forEach(function(tbl) {
-                    tbl.querySelectorAll('tr').forEach(function(tr) {
-                        var cells = tr.querySelectorAll('th, td');
-                        for (var i = 0; i < cells.length - 1; i++) {
-                            var key = cells[i].innerText.trim().replace(/\\s+/g,' ');
-                            var val = cells[i+1].innerText.trim().replace(/\\s+/g,' ');
-                            if (key && val && key.length < 30 && val.length < 200) {
-                                result.info[key] = val;
-                            }
+                    // 성능기록부: 성능/점검/진단 링크·iframe·버튼 onclick
+                    var perf = {links: [], info: {}, perfSection: '', frames: []};
+                    doc.querySelectorAll('a, button, input[type="button"], area').forEach(function(el){
+                        var text = (el.textContent || el.value || '').trim().replace(/\\s+/g, ' ');
+                        var href = el.getAttribute('href') || '';
+                        var onclick = el.getAttribute('onclick') || '';
+                        var all = text + ' ' + href + ' ' + onclick;
+                        if (/성능|점검|진단|기록부|보험이력|이력/.test(text) || /erform|nspect|heck|Record/i.test(href + onclick)) {
+                            perf.links.push({text: text.substring(0, 50), href: href.substring(0, 300), onclick: onclick.substring(0, 300)});
                         }
                     });
-                });
-
-                document.querySelectorAll('dt').forEach(function(dt) {
-                    var dd = dt.nextElementSibling;
-                    if (dd && dd.tagName === 'DD') {
-                        var key = dt.innerText.trim();
-                        var val = dd.innerText.trim();
-                        if (key && val && key.length < 30) result.info[key] = val.substring(0,200);
-                    }
-                });
-
-                var keywords = ['성능', '점검', '사고', '침수', '교환', '판금', '도색'];
-                document.querySelectorAll('div, section').forEach(function(el) {
-                    var t = el.innerText || '';
-                    if (t.length > 20 && t.length < 2000) {
-                        var hit = keywords.some(function(k){ return t.indexOf(k) !== -1; });
-                        if (hit && !result.perfSection) {
-                            result.perfSection = t.substring(0, 1500);
+                    doc.querySelectorAll('iframe, frame').forEach(function(f){ perf.frames.push(abs(f.getAttribute('src') || '')); });
+                    doc.querySelectorAll('tr').forEach(function(tr){
+                        var cells = tr.querySelectorAll('th, td');
+                        for (var i = 0; i < cells.length - 1; i++) {
+                            var k = cells[i].textContent.trim().replace(/\\s+/g, ' ');
+                            var v = cells[i+1].textContent.trim().replace(/\\s+/g, ' ');
+                            if (k && v && k.length < 30 && v.length < 300) perf.info[k] = v;
                         }
-                    }
-                });
+                    });
+                    doc.querySelectorAll('dt').forEach(function(dt){
+                        var dd = dt.nextElementSibling;
+                        if (dd && dd.tagName === 'DD') {
+                            var k = dt.textContent.trim(), v = dd.textContent.trim().replace(/\\s+/g, ' ');
+                            if (k && v && k.length < 30) perf.info[k] = v.substring(0, 300);
+                        }
+                    });
+                    var best = '';
+                    doc.querySelectorAll('div, section, table').forEach(function(el){
+                        var t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+                        if (t.length > 20 && t.length < 3000 && /성능|점검|사고|침수|교환|판금|도색/.test(t)) {
+                            if (!best || t.length < best.length) best = t;
+                        }
+                    });
+                    perf.perfSection = best.substring(0, 2000);
 
-                return result;
-            """) or {}
+                    var out = {status: res.status, len: res.html.length, photos: photos, perf: perf};
+                    if (dump) {
+                        out.title = doc.title;
+                        out.text = (doc.body ? doc.body.textContent : '').replace(/\\s+/g, ' ').substring(0, 1500);
+                        out.scripts = [];
+                        doc.querySelectorAll('script[src]').forEach(function(s){ out.scripts.push(s.getAttribute('src')); });
+                        var fns = res.html.match(/function\\s+\\w*(?:[Pp]erform|[Cc]heck|[Ii]nspect|[Rr]ecord)\\w*\\s*\\([^)]*\\)\\s*\\{[\\s\\S]{0,400}/g) || [];
+                        out.fns = fns.slice(0, 5);
+                    }
+                    done(out);
+                }).catch(function(e){ done({error: String(e)}); });
+            """, 차.get("encarno", ""), i == 0) or {}
+
+            if 상세.get("error"):
+                raise Exception(상세["error"])
+            if i == 0:
+                # 첫 차 1대는 상세 페이지 구조를 로그에 남긴다 (성능기록부 위치 확인용)
+                print(f"\n  [상세 구조] 응답={상세.get('status')} 길이={상세.get('len')} 제목={상세.get('title')}")
+                print(f"  [상세 구조] 사진 {len(상세.get('photos', []))}장 예: {상세.get('photos', [])[:3]}")
+                print(f"  [상세 구조] 성능 링크: {json.dumps(상세.get('perf', {}).get('links', [])[:10], ensure_ascii=False)}")
+                print(f"  [상세 구조] iframe: {상세.get('perf', {}).get('frames', [])}")
+                print(f"  [상세 구조] 표 항목: {list(상세.get('perf', {}).get('info', {}).keys())[:40]}")
+                print(f"  [상세 구조] 스크립트: {상세.get('scripts')}")
+                print(f"  [상세 구조] 관련 함수: {json.dumps(상세.get('fns'), ensure_ascii=False)[:1500]}")
+                print(f"  [상세 구조] 본문: {상세.get('text')}")
+                print(f"  [{i+1:>4}/{len(배치)}] {차종:20s} ", end="", flush=True)
+
+            사진들 = 상세.get("photos", []) or []
+            성능 = 상세.get("perf", {}) or {}
 
             차["사진URL들"] = 사진들
             차["성능기록부"] = 성능
