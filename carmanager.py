@@ -119,6 +119,8 @@ DB_파일 = "매물_데이터.db"
 보고서_파일 = "매물_보고서.csv"
 최대_페이지 = 0  # 0 = 전체, 숫자 = 해당 페이지까지만
 상세_사진_배치 = 100  # 한 번에 상세 사진 수집할 차량 수
+세션_갱신_페이지 = 20  # N페이지마다 쿠키 날리고 재로그인 (봇 감지 방지)
+세션_갱신_상세 = 20  # 상세 N대마다 쿠키 날리고 재로그인
 HEADLESS = "--headless" in sys.argv
 
 # Supabase (.env 파일에서 읽음)
@@ -936,6 +938,23 @@ def 전체_수집(드라이버, 아이디, 비밀번호):
     for p in range(1, 총_페이지 + 1):
         print(f"  [{p:>4}/{총_페이지}] ", end="", flush=True)
 
+        # 세션 갱신: N페이지마다 쿠키 날리고 재로그인 (봇 감지 방지)
+        if p > 1 and 세션_갱신_페이지 > 0 and (p - 1) % 세션_갱신_페이지 == 0:
+            갱신대기 = random.uniform(15, 30)
+            print(f"\n  [세션 갱신] 쿠키 초기화 + 재로그인 ({갱신대기:.0f}초 대기 후)...")
+            time.sleep(갱신대기)
+            드라이버.delete_all_cookies()
+            time.sleep(2)
+            if not 로그인(드라이버, 아이디, 비밀번호):
+                print("  재로그인 실패! 기존 데이터로 계속...")
+                break
+            드라이버.get(f"{사이트}/Car/Data")
+            time.sleep(5)
+            for _ in range(3):
+                alert_처리(드라이버)
+                time.sleep(1)
+            print(f"  [{p:>4}/{총_페이지}] ", end="", flush=True)
+
         if p > 1:
             대기 = random.uniform(8, 15)
             if p % 10 == 0:
@@ -1056,6 +1075,24 @@ def 상세_사진_수집(드라이버, 차량_목록):
         차종 = 차.get("차종", "?")
         if len(차종) > 20:
             차종 = 차종[:20]
+
+        # 세션 갱신: N대마다 쿠키 날리고 재로그인 (봇 감지 방지)
+        if i > 0 and 세션_갱신_상세 > 0 and i % 세션_갱신_상세 == 0:
+            갱신대기 = random.uniform(15, 30)
+            print(f"\n  [세션 갱신] 쿠키 초기화 + 재로그인 ({갱신대기:.0f}초 대기 후)...")
+            time.sleep(갱신대기)
+            드라이버.delete_all_cookies()
+            time.sleep(2)
+            아이디 = os.environ.get("CM_ID", "").strip()
+            비밀번호 = os.environ.get("CM_PW", "").strip()
+            if 아이디 and 비밀번호:
+                if not 로그인(드라이버, 아이디, 비밀번호):
+                    print("  재로그인 실패! 상세 수집 중단...")
+                    break
+            else:
+                print("  .env에 계정 없음 — 상세 수집 중단...")
+                break
+
         print(f"  [{i+1:>4}/{len(배치)}] {차종:20s} ", end="", flush=True)
 
         if i > 0:
