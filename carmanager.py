@@ -24,7 +24,7 @@ import re
 import getpass
 import random
 from datetime import datetime, timedelta
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote, unquote
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -429,7 +429,7 @@ def DB_초기화():
         );
     """)
     # 기존 DB에 없는 컬럼 추가
-    for col in ["사진URL들 TEXT", "성능기록부 TEXT", "검색지역 TEXT"]:
+    for col in ["사진URL들 TEXT", "성능기록부 TEXT", "검색지역 TEXT", "기록부링크 TEXT"]:
         try:
             db.execute(f"ALTER TABLE 차량 ADD COLUMN {col}")
         except Exception:
@@ -819,7 +819,7 @@ def HTML에서_차량_추출(html):
             m = re.search(r"['\"]([A-Za-z0-9+/=]{10,})['\"]", 링크원문)
             if m:
                 차["encarno"] = m.group(1)
-                차["상세링크"] = f"{사이트}/PopupFrame/CarDetailEnc/?encarno={m.group(1)}"
+                차["상세링크"] = _상세링크(m.group(1))
 
         reg = row.select_one("span.uc_carreg")
         if reg:
@@ -1320,7 +1320,7 @@ def DB_상세_대상(최대):
         if not 차.get("encarno"):
             m = re.search(r"encarno=([^&]+)", r["상세링크"] or "")
             if m:
-                차["encarno"] = m.group(1)
+                차["encarno"] = unquote(m.group(1))
         차.setdefault("차종", r["차종"] or "?")
         차.setdefault("상세링크", r["상세링크"])
         if 차.get("encarno"):
@@ -1677,6 +1677,92 @@ def _성능기록부_가져오기(주소, 상세주소=""):
         return {"url": 주소, "error": str(e)[:200]}
 
 
+def _상세링크(encarno):
+    """카매니저 상세 링크 (로그인한 브라우저에서 열림). 사이트의 「최근 본 차량」과 같은 형식,
+    차 번호의 + = / 기호는 주소용으로 바꿔 넣음 (안 바꾸면 + 가 공백으로 읽혀 안 열림)."""
+    return f"{사이트}/PopupFrame/CarDetailEnc?encarno={quote(encarno or '', safe='')}"
+
+
+_수파베이스_새칸_없음 = False  # performance_url / performance_summary 칸이 아직 없으면 True (SQL 실행 전)
+
+
+def _상세_저장(번호, 성능, 사진들=None):
+    """상세 결과를 로컬 DB + Supabase 에 저장. 기록부 링크(누구나 열림)·요약은 따로 칸에도."""
+    global _수파베이스_새칸_없음
+    성능JSON = json.dumps(성능, ensure_ascii=False)
+    기록 = 성능.get("record") or {}
+    링크 = None
+    if 기록 and not 기록.get("error") and (기록.get("provider") or 기록.get("exists")):
+        링크 = 기록.get("final_url") or 기록.get("url")
+    요약 = 기록.get("summary") or {}
+    if 기록.get("rendered") is not None or 기록.get("exists") is not None:
+        요약 = dict(요약, 기록부=("있음" if 기록.get("exists") else ("확인 전" if 기록.get("exists") is None else "없음")))
+    요약JSON = json.dumps(요약, ensure_ascii=False) if 요약 else None
+    사진JSON = json.dumps(사진들, ensure_ascii=False) if 사진들 else None
+
+    db = DB_연결()
+    try:
+        db.execute("UPDATE 차량 SET 사진URL들=COALESCE(?,사진URL들), 성능기록부=?, 기록부링크=COALESCE(?,기록부링크) "
+                   "WHERE 차량번호=?", (사진JSON, 성능JSON, 링크, 번호))
+        db.commit()
+    finally:
+        db.close()
+
+    if not supabase_client:
+        return
+    업데이트 = {"performance_record": 성능JSON}
+    if 사진JSON:
+        업데이트["photo_urls"] = 사진JSON
+    새칸 = {}
+    if 링크:
+        새칸["performance_url"] = 링크
+    if 요약JSON:
+        새칸["performance_summary"] = 요약JSON
+    테이블 = supabase_client.table("car_listings")
+    if 새칸 and not _수파베이스_새칸_없음:
+        try:
+            테이블.update(dict(업데이트, **새칸)).eq("car_id", 번호).execute()
+            return
+        except Exception as e:
+            if "performance_url" in str(e) or "performance_summary" in str(e) or "column" in str(e).lower():
+                _수파베이스_새칸_없음 = True
+                print("\n  (Supabase 에 기록부 링크·요약 칸이 아직 없어서 그 둘은 빼고 저장. SQL 실행하면 다음부터 들어감)")
+    try:
+        테이블.update(업데이트).eq("car_id", 번호).execute()
+    except Exception:
+        pass
+
+
+def 상세링크_고치기():
+    """예전 형식(…CarDetailEnc/?encarno=기호 그대로) 상세링크를 새 형식으로 (DB + Supabase). 사이트 접속 없음."""
+    db = DB_연결()
+    try:
+        rows = db.execute("SELECT 차량번호, 상세링크 FROM 차량 WHERE 상세링크 LIKE '%CarDetailEnc/?encarno=%'").fetchall()
+        고친 = []
+        for r in rows:
+            m = re.search(r"encarno=([^&]+)", r["상세링크"] or "")
+            if not m:
+                continue
+            새 = _상세링크(unquote(m.group(1)))
+            db.execute("UPDATE 차량 SET 상세링크=? WHERE 차량번호=?", (새, r["차량번호"]))
+            고친.append((r["차량번호"], 새))
+        db.commit()
+    finally:
+        db.close()
+    if 고친:
+        print(f"  상세링크 새 형식으로 고침: {len(고친)}대" + (" (Supabase 반영 중…)" if supabase_client else ""))
+    if supabase_client:
+        실패 = 0
+        for 번호, 새 in 고친:
+            try:
+                supabase_client.table("car_listings").update({"detail_url": 새}).eq("car_id", 번호).execute()
+            except Exception:
+                실패 += 1
+        if 실패:
+            print(f"  Supabase 상세링크 반영 실패 {실패}대")
+    return len(고친)
+
+
 def _사진_원본주소(사진들):
     """상세 사진 주소 끝의 _TH(300×225 미리보기)를 빼서 원본(1024×768) 주소로. 같은 사진은 하나만."""
     결과, 본 = [], set()
@@ -1809,16 +1895,7 @@ def 기록부_채우기(드라이버, 최대=200):
             p["record"] = 기록
         p["detail_v"] = 상세_버전
         p["record_filled_at"] = _지금글()
-        성능JSON = json.dumps(p, ensure_ascii=False)
-        db = DB_연결()
-        db.execute("UPDATE 차량 SET 성능기록부=? WHERE 차량번호=?", (성능JSON, 번호))
-        db.commit()
-        db.close()
-        if supabase_client:
-            try:
-                supabase_client.table("car_listings").update({"performance_record": 성능JSON}).eq("car_id", 번호).execute()
-            except Exception:
-                pass
+        _상세_저장(번호, p)
         채움 += 1
     print(f"  기록부 채우기 끝: {채움}/{len(대상)}대")
     return 채움
@@ -2053,29 +2130,7 @@ def 상세_사진_수집(드라이버, 차량_목록, 최대=None):
                 수집_성공 += 1
                 총_장수 += len(사진들)
                 print(" | ".join(부분출력) if 부분출력 else "내용 없음")
-
-                성능JSON = json.dumps(성능, ensure_ascii=False)
-
-                db = DB_연결()
-                사진JSON = json.dumps(사진들, ensure_ascii=False) if 사진들 else None
-                db.execute(
-                    "UPDATE 차량 SET 사진URL들=COALESCE(?,사진URL들), 성능기록부=COALESCE(?,성능기록부) WHERE 차량번호=?",
-                    (사진JSON, 성능JSON, 번호)
-                )
-                db.commit()
-                db.close()
-
-                if supabase_client:
-                    try:
-                        업데이트 = {}
-                        if 사진들:
-                            업데이트["photo_urls"] = json.dumps(사진들, ensure_ascii=False)
-                        if 성능JSON:
-                            업데이트["performance_record"] = 성능JSON
-                        if 업데이트:
-                            supabase_client.table("car_listings").update(업데이트).eq("car_id", 번호).execute()
-                    except Exception:
-                        pass
+                _상세_저장(번호, 성능, 사진들)
             else:
                 print(f"상세 응답 이상 (상태={상세.get('status')} 길이={상세.get('len')}) — 다음 실행에 다시")
                 if 상세.get("head"):
@@ -2191,6 +2246,7 @@ def 메인():
         DB_초기화()
         Supabase_초기화()
         print(f"\n  ===== 기록부만 채우기 {_지금글()} (카매니저 접속 없음) =====")
+        상세링크_고치기()
         사진주소_원본으로_고치기()
         드라이버 = 브라우저_열기()
         try:
@@ -2242,6 +2298,9 @@ def 메인():
         return
 
     Supabase_초기화()
+    # 예전 형식으로 저장된 링크·사진 주소 고치기 (처음 한 번만 실제로 일함, 사이트 접속 없음)
+    상세링크_고치기()
+    사진주소_원본으로_고치기()
 
     print("\n  브라우저 여는 중..." + (" (헤드리스)" if HEADLESS else ""))
     드라이버 = 브라우저_열기()
