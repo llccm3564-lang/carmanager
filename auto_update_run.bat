@@ -20,12 +20,7 @@ if exist "%TEMP_DIR%" rmdir /s /q "%TEMP_DIR%"
 powershell -Command "Expand-Archive -Path '%TEMP_ZIP%' -DestinationPath '%TEMP_DIR%' -Force"
 
 echo [3/4] Applying update...
-if exist "%DIR%.env" copy "%DIR%.env" "%TEMP%\cm_env_backup" >nul 2>&1
 xcopy "%TEMP_DIR%\carmanager-master\*" "%DIR%" /s /y /q >nul 2>&1
-if exist "%TEMP%\cm_env_backup" (
-    copy "%TEMP%\cm_env_backup" "%DIR%.env" >nul 2>&1
-    del "%TEMP%\cm_env_backup" >nul 2>&1
-)
 
 echo [4/4] Installing packages and running...
 py -m pip install -r "%DIR%requirements.txt" -q 2>nul
