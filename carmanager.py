@@ -1677,6 +1677,48 @@ def _성능기록부_가져오기(주소, 상세주소=""):
         return {"url": 주소, "error": str(e)[:200]}
 
 
+def _사진_원본주소(사진들):
+    """상세 사진 주소 끝의 _TH(300×225 미리보기)를 빼서 원본(1024×768) 주소로. 같은 사진은 하나만."""
+    결과, 본 = [], set()
+    for u in 사진들 or []:
+        원본 = re.sub(r"_TH(\.(?:jpe?g|png|webp|gif))(\?.*)?$", r"\1\2", u or "", flags=re.I).replace("None", "")
+        if 원본 and 원본 not in 본:
+            본.add(원본)
+            결과.append(원본)
+    return 결과
+
+
+def 사진주소_원본으로_고치기():
+    """이미 미리보기(_TH) 주소로 저장된 차의 사진 주소를 원본으로 (DB + Supabase). 사이트 접속 없음."""
+    db = DB_연결()
+    try:
+        # 'TH.' 가 들어간 행만 후보로 (실제로 바뀌는 행만 아래에서 고침)
+        rows = db.execute("SELECT 차량번호, 사진URL들 FROM 차량 WHERE 사진URL들 LIKE '%TH.%'").fetchall()
+        고친 = []
+        for r in rows:
+            try:
+                원래 = json.loads(r["사진URL들"] or "[]")
+            except Exception:
+                continue
+            새것 = _사진_원본주소(원래)
+            if 새것 != 원래:
+                db.execute("UPDATE 차량 SET 사진URL들=? WHERE 차량번호=?", (json.dumps(새것, ensure_ascii=False), r["차량번호"]))
+                고친.append((r["차량번호"], 새것))
+        db.commit()
+    finally:
+        db.close()
+    if supabase_client:
+        for 번호, 새것 in 고친:
+            try:
+                supabase_client.table("car_listings").update(
+                    {"photo_urls": json.dumps(새것, ensure_ascii=False)}).eq("car_id", 번호).execute()
+            except Exception:
+                pass
+    if 고친:
+        print(f"  사진 주소 원본으로 고침: {len(고친)}대")
+    return len(고친)
+
+
 def _엠파크_기록부_그리기(드라이버, 기록):
     """엠파크 성능기록부(m-park.co.kr/popup/performance/<번호>)를 브라우저로 그려서 내용 읽기.
     체크된 칸은 ■, 안 된 칸은 □ 로 글에 표시 (예: 「7.변속기 종류 ■자동 □수동」). 카매니저 접속 없음."""
@@ -1968,7 +2010,7 @@ def 상세_사진_수집(드라이버, 차량_목록, 최대=None):
                 print(f"  [상세 구조] 본문: {상세.get('text')}")
                 print(f"  [{i+1:>4}/{len(배치)}] {차종:20s} ", end="", flush=True)
 
-            사진들 = 상세.get("photos", []) or []
+            사진들 = _사진_원본주소(상세.get("photos", []) or [])
             성능 = 상세.get("perf", {}) or {}
 
             # 성능점검기록부 본문: 상세 페이지 iframe 이 외부 기록부 페이지를 불러옴 → 그 주소를 직접 연다
@@ -2149,6 +2191,7 @@ def 메인():
         DB_초기화()
         Supabase_초기화()
         print(f"\n  ===== 기록부만 채우기 {_지금글()} (카매니저 접속 없음) =====")
+        사진주소_원본으로_고치기()
         드라이버 = 브라우저_열기()
         try:
             기록부_채우기(드라이버, 최대=1000)
