@@ -436,6 +436,7 @@ def DB_초기화():
             pass
     db.commit()
     db.close()
+    _상세버전_정리()
 
 
 def 차량_저장(차량_목록):
@@ -1616,7 +1617,7 @@ def _총_페이지_수(드라이버):
 # 상세 사진 수집 (차량별 여러 장)
 # ════════════════════════════════════════════════════════════
 _기록부_구조_출력함 = False
-상세_버전 = 2  # 상세 수집 방식이 바뀌면 올림 → 예전 방식으로 받은 차는 다시 받음
+상세_버전 = 3  # 상세 수집 방식이 바뀌면 올림 → 예전 방식으로 받은 차는 다시 받음 (3: 기록부 출처 4가지, 11-23)
 
 
 def _성능기록부_가져오기(주소, 상세주소=""):
@@ -1805,17 +1806,47 @@ def 사진주소_원본으로_고치기():
     return len(고친)
 
 
-def _엠파크_기록부_그리기(드라이버, 기록):
-    """엠파크 성능기록부(m-park.co.kr/popup/performance/<번호>)를 브라우저로 그려서 내용 읽기.
+def _기록부_출처(성능):
+    """상세 페이지 정보로 성능기록부가 어디 있는지 정함 (sCarDetail.js 의 성능점검 탭과 같은 순서).
+    1) carcheckoutUrl(별도 점검업체 주소) 2) NewGubun=A → autocafe 2020 양식(ChkSeq)
+    3) NewGubun=Y/N → 카매니저 자체 기록부 화면 (카매니저 요청이 하나 더 필요해서 지금은 표시만)
+    4) iframe 의 autocafe 옛 양식(OnCarNo) — 엠파크 차는 여기서 엠파크 기록부로 넘어감"""
+    co = 성능.get("checkout") or {}
+    주소 = (co.get("url") or "").strip()
+    if 주소.startswith("http"):
+        return {"kind": "별도주소", "url": 주소.replace("print=1", "print=0")}
+    chk = (co.get("chkseq") or "").strip()
+    gubun = (co.get("newgubun") or "").strip()
+    if gubun == "A" and chk and chk != "0":
+        return {"kind": "autocafe2020", "url": f"http://www.autocafe.co.kr/asso/Check_Form_2020_2p.asp?Chkseq={chk}"}
+    if gubun in ("Y", "N") and chk and chk != "0":
+        return {"kind": "카매니저자체", "chkseq": chk, "newgubun": gubun, "url": None}
+    for u in [co.get("iframe") or ""] + list(성능.get("frames") or []):
+        if u and u.startswith("http") and re.search(r"CarCheck|Check_Form|[Pp]erform|[Ii]nspect", u):
+            return {"kind": "autocafe", "url": u}
+    return None
+
+
+_기록부_구조_출력한_종류 = set()
+
+
+def _기록부_그리기(드라이버, 기록):
+    """성능기록부 페이지를 브라우저로 열어 내용 읽기 (autocafe·엠파크·별도 업체 모두).
+    브라우저는 autocafe 인증서 문제도 알아서 처리하고, 화면에서 그려지는 엠파크 페이지도 읽힘.
     체크된 칸은 ■, 안 된 칸은 □ 로 글에 표시 (예: 「7.변속기 종류 ■자동 □수동」). 카매니저 접속 없음."""
-    주소 = 기록.get("final_url") or 기록.get("url")
+    주소 = 기록.get("url")
+    if not 주소:
+        기록.update({"rendered": True, "exists": None})
+        return 기록
     try:
         드라이버.get(주소)
-        for _ in range(20):
+        글 = ""
+        for _ in range(15):
             time.sleep(1)
-            n = len((드라이버.execute_script("return document.body ? document.body.innerText : ''") or "").strip())
-            if n > 300:
+            글 = (드라이버.execute_script("return document.body ? document.body.innerText : ''") or "").strip()
+            if "내역이 없습니다" in 글 or len(글) > 300:
                 break
+        time.sleep(1)
         r = 드라이버.execute_script("""
             var checked = [];
             document.querySelectorAll('input[type=checkbox],input[type=radio]').forEach(function(x){
@@ -1827,9 +1858,14 @@ def _엠파크_기록부_그리기(드라이버, 기록):
             });
             var text = (document.body ? document.body.innerText : '')
                 .replace(/[ \\t]+/g, ' ').replace(/\\n\\s*\\n+/g, '\\n').trim();
-            return {text: text, checked: checked};
+            return {text: text, checked: checked, url: location.href, inputs: document.querySelectorAll('input').length,
+                    imgs: Array.from(document.images).slice(0, 15).map(function(i){ return i.src; })};
         """) or {}
         글 = r.get("text") or ""
+        최종 = r.get("url") or 주소
+        if "m-park.co.kr/popup/performance" in 최종:
+            기록["provider"] = "m-park"
+            기록["checkNo"] = 최종.rstrip("/").rsplit("/", 1)[-1]
         요약 = {}
         for 키, 식 in [("등록번호", r"자동차등록번호\s*\n\s*(\S+)"), ("차대번호", r"차대번호\s*\n\s*([A-Z0-9]{11,17})"),
                       ("최초등록일", r"최초등록일\s*\n\s*(\d{8})"), ("주행거리", r"현재 주행거리\s*:\s*\[([\d,]+)\s*km\]"),
@@ -1837,22 +1873,28 @@ def _엠파크_기록부_그리기(드라이버, 기록):
             m = re.search(식, 글)
             if m:
                 요약[키] = " ".join(m.group(1).split())
-        기록.update({"rendered": True, "exists": ("발행번호" in 글 and len(글) > 300),
+        없음 = "내역이 없습니다" in 글 or len(글) < 100
+        기록.update({"rendered": True, "exists": not 없음, "final_url": 최종,
                    "text": 글[:12000], "checked": (r.get("checked") or [])[:400], "summary": 요약})
+        종류 = 기록.get("provider") or 기록.get("kind")
+        if not 없음 and 종류 not in _기록부_구조_출력한_종류:
+            _기록부_구조_출력한_종류.add(종류)
+            print(f"\n  [기록부 구조 {종류}] {최종} 글자={len(글)} 체크칸={len(r.get('checked') or [])} "
+                  f"입력칸={r.get('inputs')} 요약={json.dumps(요약, ensure_ascii=False)}")
+            print(f"  [기록부 구조 {종류}] 이미지: {r.get('imgs')}")
+            print(f"  [기록부 구조 {종류}] 본문 앞: {' '.join(글.split())[:800]}")
     except Exception as e:
         기록.update({"rendered": False, "render_error": str(e)[:200]})
     return 기록
 
 
 def 기록부_채우기(드라이버, 최대=200):
-    """상세는 받았는데 성능기록부 내용이 빠진 차를 채운다 (엠파크 그리기·예전 인증서 실패분).
-    기록부 사이트(autocafe·엠파크)만 열고 카매니저에는 접속하지 않는다."""
+    """상세는 받았는데 성능기록부 내용을 아직 안 읽은 차를 채운다. 기록부 사이트만 열고 카매니저엔 접속 안 함."""
     db = DB_연결()
     try:
         rows = db.execute("""
             SELECT 차량번호, 성능기록부 FROM 차량
-            WHERE 성능기록부 IS NOT NULL
-              AND (성능기록부 NOT LIKE ? OR (성능기록부 LIKE '%"provider": "m-park"%' AND 성능기록부 LIKE '%"rendered": false%'))
+            WHERE 성능기록부 LIKE ? AND 성능기록부 LIKE '%"rendered": false%'
         """, (f'%"detail_v": {상세_버전}%',)).fetchall()
     finally:
         db.close()
@@ -1862,43 +1904,62 @@ def 기록부_채우기(드라이버, 최대=200):
             p = json.loads(r["성능기록부"])
         except Exception:
             continue
-        if not (p.get("info") or p.get("links")):
-            continue  # 상세 자체를 정상으로 못 받은 차는 상세부터 다시
         기록 = p.get("record") or {}
-        주소들 = [u for u in (p.get("frames") or [])
-                if u and u.startswith("http") and re.search(r"CarCheck|Check_Form|[Pp]erform|[Ii]nspect", u)]
-        주소 = 기록.get("url") or (주소들[0] if 주소들 else None)
-        대상.append((r["차량번호"], p, 기록, 주소))
+        if 기록 and not 기록.get("rendered"):
+            대상.append((r["차량번호"], p, 기록))
         if len(대상) >= 최대:
             break
     if not 대상:
         print("\n  기록부 채우기: 할 차 없음")
         return 0
-    print(f"\n  기록부 채우기: {len(대상)}대 (카매니저 접속 없음)")
+    print(f"\n  기록부 채우기: {len(대상)}대 (기록부 사이트만, 카매니저 접속 없음)")
     채움 = 0
-    for k, (번호, p, 기록, 주소) in enumerate(대상):
+    for k, (번호, p, 기록) in enumerate(대상):
         if k > 0:
             time.sleep(random.uniform(2, 4))
-        if 주소 and (not 기록 or 기록.get("error") or not 기록.get("provider")):
-            기록 = _성능기록부_가져오기(주소)
-        elif not 주소:
-            기록 = {}
-        if 기록.get("provider") == "m-park" and not 기록.get("rendered"):
-            기록 = _엠파크_기록부_그리기(드라이버, 기록)
-        표시 = ("실패 " + 기록.get("error", 기록.get("render_error", ""))[:60]) if (기록.get("error") or 기록.get("render_error")) \
-            else ("없음(기록부 링크 없음)" if not 기록 else ("O " + json.dumps(기록.get("summary", {}), ensure_ascii=False)[:120]
-                                               if 기록.get("exists") else "내역 없음"))
+        기록 = _기록부_그리기(드라이버, 기록)
+        if 기록.get("render_error"):
+            표시 = "실패 " + 기록["render_error"][:80]
+        elif 기록.get("kind") == "카매니저자체":
+            표시 = "카매니저 자체 기록부 (아직 안 받음)"
+        elif 기록.get("exists"):
+            표시 = f"O [{기록.get('provider') or 기록.get('kind')}] " + json.dumps(기록.get("summary", {}), ensure_ascii=False)[:120]
+        else:
+            표시 = f"내역 없음 [{기록.get('kind')}]"
         print(f"  [{k+1:>4}/{len(대상)}] {번호[:12]} 기록부 {표시}")
-        if 기록.get("error") or 기록.get("render_error"):
+        if 기록.get("render_error"):
             continue
-        if 기록:
-            p["record"] = 기록
-        p["detail_v"] = 상세_버전
+        p["record"] = 기록
         p["record_filled_at"] = _지금글()
         _상세_저장(번호, p)
         채움 += 1
     print(f"  기록부 채우기 끝: {채움}/{len(대상)}대")
     return 채움
+
+
+def _상세버전_정리():
+    """상세 방식 2 → 3 (11-23 기록부 출처 4가지 반영). 2 에서 기록부를 제대로 읽은 차는 3 으로 올려 그대로 두고,
+    「내역 없음」·실패였던 차는 그대로 둬서 다음 실행에서 상세를 다시 받음 (기록부가 다른 곳에 있을 수 있어서)."""
+    db = DB_연결()
+    try:
+        rows = db.execute("SELECT 차량번호, 성능기록부 FROM 차량 WHERE 성능기록부 LIKE '%\"detail_v\": 2%'").fetchall()
+        올림 = 0
+        for r in rows:
+            try:
+                p = json.loads(r["성능기록부"])
+            except Exception:
+                continue
+            기록 = p.get("record") or {}
+            if 기록.get("exists") and 기록.get("rendered"):
+                p["detail_v"] = 상세_버전
+                db.execute("UPDATE 차량 SET 성능기록부=? WHERE 차량번호=?", (json.dumps(p, ensure_ascii=False), r["차량번호"]))
+                올림 += 1
+        db.commit()
+    finally:
+        db.close()
+    if rows:
+        print(f"  상세 방식 정리: 예전 방식 {len(rows)}대 중 기록부까지 읽은 {올림}대는 완료 유지, "
+              f"나머지 {len(rows) - 올림}대는 상세 다시 받기 대상")
 
 
 def 상세_사진_수집(드라이버, 차량_목록, 최대=None):
@@ -2025,6 +2086,16 @@ def 상세_사진_수집(드라이버, 차량_목록, 최대=None):
                         }
                     });
                     doc.querySelectorAll('iframe, frame').forEach(function(f){ perf.frames.push(abs(f.getAttribute('src') || '')); });
+                    // 성능기록부가 어디 있는지 (sCarDetail.js 기준): 별도 주소 carcheckoutUrl /
+                    // autocafe 2020 양식(NewGubun=A, ChkSeq) / 카매니저 자체 화면(NewGubun=Y·N) / autocafe 옛 양식(iframe)
+                    var hv = function(id){ var e = doc.getElementById(id) || doc.querySelector('[name="' + id + '"]'); return e ? (e.value || e.getAttribute('value') || '') : ''; };
+                    var cu = res.html.match(/carcheckoutUrl\\s*=\\s*["']([^"']*)["']/);
+                    var ifr = doc.getElementById('carcheckout');
+                    perf.checkout = {
+                        chkseq: hv('ChkSeq'), newgubun: hv('NewGubun'),
+                        url: cu ? cu[1] : '',
+                        iframe: ifr ? (ifr.getAttribute('src') || '') : ''
+                    };
                     doc.querySelectorAll('tr').forEach(function(tr){
                         var cells = tr.querySelectorAll('th, td');
                         for (var i = 0; i < cells.length - 1; i++) {
@@ -2091,11 +2162,10 @@ def 상세_사진_수집(드라이버, 차량_목록, 최대=None):
             성능 = 상세.get("perf", {}) or {}
 
             # 성능점검기록부 본문: 상세 페이지 iframe 이 외부 기록부 페이지를 불러옴 → 그 주소를 직접 연다
-            기록부주소 = [u for u in (성능.get("frames") or [])
-                         if u and u.startswith("http") and re.search(r"CarCheck|Check_Form|[Pp]erform|[Ii]nspect", u)]
-            if 기록부주소:
-                time.sleep(random.uniform(1, 2))
-                성능["record"] = _성능기록부_가져오기(기록부주소[0], 링크)
+            # 기록부는 여기서 열지 않고 어디 있는지만 적어 둠 → 상세 끝난 뒤 기록부_채우기 가 브라우저로 읽음
+            출처 = _기록부_출처(성능)
+            if 출처:
+                성능["record"] = dict(출처, rendered=False, exists=None)
 
             차["사진URL들"] = 사진들
             차["성능기록부"] = 성능
@@ -2111,12 +2181,9 @@ def 상세_사진_수집(드라이버, 차량_목록, 최대=None):
                 부분출력.append("성능섹션O")
             기록 = 성능.get("record") or {}
             if 기록:
-                if 기록.get("error"):
-                    부분출력.append(f"기록부 실패({기록['error'][:60]})")
-                elif 기록.get("provider") == "m-park":
-                    부분출력.append(f"기록부 엠파크 {기록.get('checkNo')}(내용은 따로)")
-                else:
-                    부분출력.append("기록부O" if 기록.get("exists") else "기록부 없음")
+                부분출력.append(f"기록부 위치: {기록.get('kind')}" + ("" if 기록.get("kind") == "카매니저자체" else "(끝나고 읽음)"))
+            else:
+                부분출력.append("기록부 위치 없음")
 
             # 상세 응답을 정상으로 받았고 기록부 요청도 실패하지 않았으면 「완료표시」 → 다음 실행부터 건너뜀
             # (사진이 원래 없는 차도 여기서 끝. 실패한 차는 표시 안 해서 다음 실행에 다시 시도)
