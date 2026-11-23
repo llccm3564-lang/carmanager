@@ -1216,6 +1216,7 @@ def _총_페이지_수(드라이버):
 # 상세 사진 수집 (차량별 여러 장)
 # ════════════════════════════════════════════════════════════
 _기록부_구조_출력함 = False
+상세_버전 = 2  # 상세 수집 방식이 바뀌면 올림 → 예전 방식으로 받은 차는 다시 받음
 
 
 def _성능기록부_가져오기(주소, 상세주소=""):
@@ -1263,12 +1264,14 @@ def _성능기록부_가져오기(주소, 상세주소=""):
 def 상세_사진_수집(드라이버, 차량_목록):
     """각 차량 상세 페이지에서 사진 여러 장 수집 (배치 단위)"""
 
-    # 이미 사진을 수집한 차량 제외
+    # 이미 상세를 끝낸 차량 제외
+    # 기준 = 지금 방식으로 상세(사진+내용+성능기록부)를 받아 「완료표시」가 저장된 차.
+    # 사진만 있는 옛 기록은 성능기록부가 없으므로 다시 받고, 사진이 원래 없는 차는 한 번 받으면 끝.
     수집완료 = set()
     db = DB_연결()
     try:
         rows = db.execute(
-            "SELECT 차량번호 FROM 차량 WHERE 사진URL들 IS NOT NULL AND 사진URL들 != '' AND 사진URL들 != '[]'"
+            "SELECT 차량번호 FROM 차량 WHERE 성능기록부 LIKE ?", (f'%"detail_v": {상세_버전}%',)
         ).fetchall()
         수집완료 = {r["차량번호"] for r in rows}
     except Exception:
@@ -1465,13 +1468,26 @@ def 상세_사진_수집(드라이버, 차량_목록):
                 부분출력.append(f"상세{len(성능['info'])}항목")
             if 성능.get("perfSection"):
                 부분출력.append("성능섹션O")
+            기록 = 성능.get("record") or {}
+            if 기록:
+                if 기록.get("error"):
+                    부분출력.append("기록부 실패")
+                else:
+                    부분출력.append("기록부O" if 기록.get("exists") else "기록부 없음")
 
-            if 사진들 or 성능.get("info") or 성능.get("links"):
+            # 상세 응답을 정상으로 받았고 기록부 요청도 실패하지 않았으면 「완료표시」 → 다음 실행부터 건너뜀
+            # (사진이 원래 없는 차도 여기서 끝. 실패한 차는 표시 안 해서 다음 실행에 다시 시도)
+            정상응답 = 상세.get("status") == 200 and (상세.get("len") or 0) > 1000
+            if 정상응답 and not 기록.get("error"):
+                성능["detail_v"] = 상세_버전
+                성능["fetched_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            if 정상응답:
                 수집_성공 += 1
                 총_장수 += len(사진들)
-                print(" | ".join(부분출력) if 부분출력 else "데이터 없음")
+                print(" | ".join(부분출력) if 부분출력 else "내용 없음")
 
-                성능JSON = json.dumps(성능, ensure_ascii=False) if (성능.get("info") or 성능.get("links") or 성능.get("perfSection")) else None
+                성능JSON = json.dumps(성능, ensure_ascii=False)
 
                 db = DB_연결()
                 사진JSON = json.dumps(사진들, ensure_ascii=False) if 사진들 else None
@@ -1494,7 +1510,7 @@ def 상세_사진_수집(드라이버, 차량_목록):
                     except Exception:
                         pass
             else:
-                print("데이터 없음")
+                print(f"상세 응답 이상 (상태={상세.get('status')} 길이={상세.get('len')}) — 다음 실행에 다시")
 
         except Exception as e:
             차["사진URL들"] = []
