@@ -1623,11 +1623,27 @@ def _성능기록부_가져오기(주소, 상세주소=""):
     """상세 페이지 iframe 이 불러오는 성능점검기록부(예: autocafe.co.kr/ASSO/CarCheck_Form.asp?OnCarNo=...)를 직접 열어 내용 해석.
     로그인 없이 열리는 페이지라 requests 로 받는다."""
     global _기록부_구조_출력함
+    머리 = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
+        "Referer": 상세주소 or f"{사이트}/",
+    }
     try:
-        r = requests.get(주소, timeout=20, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
-            "Referer": 상세주소 or f"{사이트}/",
-        })
+        try:
+            r = requests.get(주소, timeout=20, headers=머리)
+        except requests.exceptions.SSLError:
+            # autocafe 는 인증서 일부를 빠뜨려 파이썬이 거절함 → 사이트 자체 코드(protocacheck)처럼 http 로
+            if not 주소.startswith("https://"):
+                raise
+            r = requests.get("http://" + 주소[len("https://"):], timeout=20, headers=머리)
+        최종 = r.url or 주소
+
+        # 엠파크 단지 차: autocafe → m-park.co.kr/popup/performance/<번호> 로 넘어감.
+        # 이 페이지는 화면에서 그려지는 방식이라 요청만으로는 내용이 비어 있음 → 주소·번호만 저장,
+        # 내용은 따로 기록부_채우기() 에서 브라우저로 그려서 받음 (카매니저 접속 없음)
+        if "m-park.co.kr/popup/performance" in 최종:
+            return {"url": 주소, "final_url": 최종, "provider": "m-park",
+                    "checkNo": 최종.rstrip("/").rsplit("/", 1)[-1], "status": r.status_code,
+                    "exists": None, "rendered": False}
         try:
             html = r.content.decode("utf-8")
         except UnicodeDecodeError:
@@ -1659,6 +1675,111 @@ def _성능기록부_가져오기(주소, 상세주소=""):
         return 결과
     except Exception as e:
         return {"url": 주소, "error": str(e)[:200]}
+
+
+def _엠파크_기록부_그리기(드라이버, 기록):
+    """엠파크 성능기록부(m-park.co.kr/popup/performance/<번호>)를 브라우저로 그려서 내용 읽기.
+    체크된 칸은 ■, 안 된 칸은 □ 로 글에 표시 (예: 「7.변속기 종류 ■자동 □수동」). 카매니저 접속 없음."""
+    주소 = 기록.get("final_url") or 기록.get("url")
+    try:
+        드라이버.get(주소)
+        for _ in range(20):
+            time.sleep(1)
+            n = len((드라이버.execute_script("return document.body ? document.body.innerText : ''") or "").strip())
+            if n > 300:
+                break
+        r = 드라이버.execute_script("""
+            var checked = [];
+            document.querySelectorAll('input[type=checkbox],input[type=radio]').forEach(function(x){
+                var lab = x.id ? document.querySelector('label[for="' + x.id + '"]') : null;
+                if (!lab) return;
+                var t = (lab.textContent || '').trim();
+                if (x.checked) checked.push(t);
+                lab.textContent = (x.checked ? '■' : '□') + t;
+            });
+            var text = (document.body ? document.body.innerText : '')
+                .replace(/[ \\t]+/g, ' ').replace(/\\n\\s*\\n+/g, '\\n').trim();
+            return {text: text, checked: checked};
+        """) or {}
+        글 = r.get("text") or ""
+        요약 = {}
+        for 키, 식 in [("등록번호", r"자동차등록번호\s*\n\s*(\S+)"), ("차대번호", r"차대번호\s*\n\s*([A-Z0-9]{11,17})"),
+                      ("최초등록일", r"최초등록일\s*\n\s*(\d{8})"), ("주행거리", r"현재 주행거리\s*:\s*\[([\d,]+)\s*km\]"),
+                      ("사고이력", r"사고이력[^\n]*\n((?:[■□][^\n]*\n?){2})"), ("단순수리", r"단순수리\s*\n((?:[■□][^\n]*\n?){2})")]:
+            m = re.search(식, 글)
+            if m:
+                요약[키] = " ".join(m.group(1).split())
+        기록.update({"rendered": True, "exists": ("발행번호" in 글 and len(글) > 300),
+                   "text": 글[:12000], "checked": (r.get("checked") or [])[:400], "summary": 요약})
+    except Exception as e:
+        기록.update({"rendered": False, "render_error": str(e)[:200]})
+    return 기록
+
+
+def 기록부_채우기(드라이버, 최대=200):
+    """상세는 받았는데 성능기록부 내용이 빠진 차를 채운다 (엠파크 그리기·예전 인증서 실패분).
+    기록부 사이트(autocafe·엠파크)만 열고 카매니저에는 접속하지 않는다."""
+    db = DB_연결()
+    try:
+        rows = db.execute("""
+            SELECT 차량번호, 성능기록부 FROM 차량
+            WHERE 성능기록부 IS NOT NULL
+              AND (성능기록부 NOT LIKE ? OR (성능기록부 LIKE '%"provider": "m-park"%' AND 성능기록부 LIKE '%"rendered": false%'))
+        """, (f'%"detail_v": {상세_버전}%',)).fetchall()
+    finally:
+        db.close()
+    대상 = []
+    for r in rows:
+        try:
+            p = json.loads(r["성능기록부"])
+        except Exception:
+            continue
+        if not (p.get("info") or p.get("links")):
+            continue  # 상세 자체를 정상으로 못 받은 차는 상세부터 다시
+        기록 = p.get("record") or {}
+        주소들 = [u for u in (p.get("frames") or [])
+                if u and u.startswith("http") and re.search(r"CarCheck|Check_Form|[Pp]erform|[Ii]nspect", u)]
+        주소 = 기록.get("url") or (주소들[0] if 주소들 else None)
+        대상.append((r["차량번호"], p, 기록, 주소))
+        if len(대상) >= 최대:
+            break
+    if not 대상:
+        print("\n  기록부 채우기: 할 차 없음")
+        return 0
+    print(f"\n  기록부 채우기: {len(대상)}대 (카매니저 접속 없음)")
+    채움 = 0
+    for k, (번호, p, 기록, 주소) in enumerate(대상):
+        if k > 0:
+            time.sleep(random.uniform(2, 4))
+        if 주소 and (not 기록 or 기록.get("error") or not 기록.get("provider")):
+            기록 = _성능기록부_가져오기(주소)
+        elif not 주소:
+            기록 = {}
+        if 기록.get("provider") == "m-park" and not 기록.get("rendered"):
+            기록 = _엠파크_기록부_그리기(드라이버, 기록)
+        표시 = ("실패 " + 기록.get("error", 기록.get("render_error", ""))[:60]) if (기록.get("error") or 기록.get("render_error")) \
+            else ("없음(기록부 링크 없음)" if not 기록 else ("O " + json.dumps(기록.get("summary", {}), ensure_ascii=False)[:120]
+                                               if 기록.get("exists") else "내역 없음"))
+        print(f"  [{k+1:>4}/{len(대상)}] {번호[:12]} 기록부 {표시}")
+        if 기록.get("error") or 기록.get("render_error"):
+            continue
+        if 기록:
+            p["record"] = 기록
+        p["detail_v"] = 상세_버전
+        p["record_filled_at"] = _지금글()
+        성능JSON = json.dumps(p, ensure_ascii=False)
+        db = DB_연결()
+        db.execute("UPDATE 차량 SET 성능기록부=? WHERE 차량번호=?", (성능JSON, 번호))
+        db.commit()
+        db.close()
+        if supabase_client:
+            try:
+                supabase_client.table("car_listings").update({"performance_record": 성능JSON}).eq("car_id", 번호).execute()
+            except Exception:
+                pass
+        채움 += 1
+    print(f"  기록부 채우기 끝: {채움}/{len(대상)}대")
+    return 채움
 
 
 def 상세_사진_수집(드라이버, 차량_목록, 최대=None):
@@ -1872,7 +1993,9 @@ def 상세_사진_수집(드라이버, 차량_목록, 최대=None):
             기록 = 성능.get("record") or {}
             if 기록:
                 if 기록.get("error"):
-                    부분출력.append("기록부 실패")
+                    부분출력.append(f"기록부 실패({기록['error'][:60]})")
+                elif 기록.get("provider") == "m-park":
+                    부분출력.append(f"기록부 엠파크 {기록.get('checkNo')}(내용은 따로)")
                 else:
                     부분출력.append("기록부O" if 기록.get("exists") else "기록부 없음")
 
@@ -2021,6 +2144,21 @@ def 보고서_생성():
 # 메인
 # ════════════════════════════════════════════════════════════
 def 메인():
+    # 기록부만 채우기: --records (카매니저 로그인 없이 기록부 사이트만 엶)
+    if "--records" in sys.argv:
+        DB_초기화()
+        Supabase_초기화()
+        print(f"\n  ===== 기록부만 채우기 {_지금글()} (카매니저 접속 없음) =====")
+        드라이버 = 브라우저_열기()
+        try:
+            기록부_채우기(드라이버, 최대=1000)
+        finally:
+            try:
+                드라이버.quit()
+            except Exception:
+                pass
+        return
+
     # 0) 돌려도 되는지 먼저 (브라우저·로그인 전에). 안 되면 로그도 안 올리고 바로 끝.
     DB_초기화()
     됨, 이유 = _실행_해도_되나()
@@ -2079,6 +2217,8 @@ def 메인():
             상세대상 = DB_상세_대상(남은상세)
             if 상세대상:
                 상세_사진_수집(드라이버, 상세대상, 남은상세)
+                # 상세에서 주소만 받아 둔 엠파크 기록부 내용 채우기 (기록부 사이트만, 카매니저 요청 없음)
+                기록부_채우기(드라이버, 최대=len(상세대상) + 10)
             else:
                 print("\n  상세: 남은 차 없음")
         else:
