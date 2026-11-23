@@ -937,9 +937,9 @@ def 전체_수집(드라이버, 아이디, 비밀번호):
         print(f"  [{p:>4}/{총_페이지}] ", end="", flush=True)
 
         if p > 1:
-            대기 = random.uniform(3, 7)
+            대기 = random.uniform(8, 15)
             if p % 10 == 0:
-                대기 = random.uniform(10, 20)
+                대기 = random.uniform(30, 60)
                 print(f"(쉬는 중 {대기:.0f}초) ", end="", flush=True)
             time.sleep(대기)
 
@@ -954,7 +954,7 @@ def 전체_수집(드라이버, 아이디, 비밀번호):
                 except Exception:
                     print("페이지 이동 실패 — 중단")
                     break
-            time.sleep(random.uniform(2, 4))
+            time.sleep(random.uniform(3, 6))
             alert_처리(드라이버)
 
         차량들 = HTML에서_차량_추출(드라이버.page_source)
@@ -1059,15 +1059,15 @@ def 상세_사진_수집(드라이버, 차량_목록):
         print(f"  [{i+1:>4}/{len(배치)}] {차종:20s} ", end="", flush=True)
 
         if i > 0:
-            대기 = random.uniform(2, 5)
+            대기 = random.uniform(5, 10)
             if (i + 1) % 20 == 0:
-                대기 = random.uniform(8, 15)
+                대기 = random.uniform(30, 60)
                 print(f"(쉬는 중 {대기:.0f}초) ", end="", flush=True)
             time.sleep(대기)
 
         try:
             드라이버.get(링크)
-            time.sleep(random.uniform(2, 4))
+            time.sleep(random.uniform(3, 6))
             alert_처리(드라이버)
 
             사진들 = 드라이버.execute_script("""
