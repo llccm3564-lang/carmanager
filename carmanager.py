@@ -3,13 +3,13 @@
 
 기능:
   1. 카매니저 전체 매물 정보 수집 (차종, 가격, 연식, 주행거리, 연료, 변속기, 사고, 번호판, 지역, 판매자 등)
-  2. 차량 사진 다운로드
+  2. 차량 사진 다운로드 (상세 페이지에서 여러 장)
   3. 사라진 매물(팔림/삭제) 자동 감지
   4. CSV 보고서 생성
 
 사용법:
-  py 매물확인.py              (아이디/비번 직접 입력)
-  py 매물확인.py --headless   (화면 없이 백그라운드 실행)
+  py carmanager.py              (아이디/비번 직접 입력)
+  py carmanager.py --headless   (화면 없이 백그라운드 실행, .env에서 계정 읽음)
 
 재실행하면 이전 데이터와 비교하여 사라진 매물을 자동 감지한다.
 """
@@ -118,6 +118,7 @@ DB_파일 = "매물_데이터.db"
 사진_폴더 = "사진"
 보고서_파일 = "매물_보고서.csv"
 최대_페이지 = 0  # 0 = 전체, 숫자 = 해당 페이지까지만
+상세_사진_배치 = 100  # 한 번에 상세 사진 수집할 차량 수
 HEADLESS = "--headless" in sys.argv
 
 # Supabase (.env 파일에서 읽음)
@@ -160,6 +161,8 @@ def Supabase_차량_저장(차량_목록):
         if not 번호:
             continue
 
+        사진들 = 차.get("사진URL들", [])
+
         row = {
             "car_id": 번호,
             "model": 차.get("차종", ""),
@@ -180,6 +183,9 @@ def Supabase_차량_저장(차량_목록):
             "last_seen": 지금,
             "removed_at": None,
         }
+
+        if 사진들:
+            row["photo_urls"] = json.dumps(사진들, ensure_ascii=False)
 
         try:
             기존 = 테이블.select("car_id").eq("car_id", 번호).execute()
@@ -238,6 +244,7 @@ def DB_초기화():
             판매자 TEXT,
             연락처 TEXT,
             사진URL TEXT,
+            사진URL들 TEXT,
             상세링크 TEXT,
             원본데이터 TEXT,
             최초발견 TEXT,
@@ -254,6 +261,11 @@ def DB_초기화():
             사라진_건수 INTEGER
         );
     """)
+    # 기존 DB에 사진URL들 컬럼이 없으면 추가
+    try:
+        db.execute("ALTER TABLE 차량 ADD COLUMN 사진URL들 TEXT")
+    except Exception:
+        pass
     db.commit()
     db.close()
 
@@ -270,38 +282,58 @@ def 차량_저장(차량_목록):
 
         기존 = db.execute("SELECT 1 FROM 차량 WHERE 차량번호=?", (번호,)).fetchone()
         원본 = json.dumps(차, ensure_ascii=False)
+        사진들 = 차.get("사진URL들", [])
+        사진JSON = json.dumps(사진들, ensure_ascii=False) if 사진들 else None
 
         if 기존:
-            db.execute("""
-                UPDATE 차량
-                SET 최근확인=?, 상태='등록중', 사라진날=NULL,
-                    차종=?, 가격=?, 연식=?, 주행거리=?, 연료=?, 변속기=?,
-                    색상=?, 사고여부=?, 번호판=?, 지역=?, 판매자=?, 연락처=?,
-                    사진URL=?, 상세링크=?, 원본데이터=?
-                WHERE 차량번호=?
-            """, (
-                지금,
-                차.get("차종", ""), 차.get("가격", ""), 차.get("연식", ""),
-                차.get("주행거리", ""), 차.get("연료", ""), 차.get("변속기", ""),
-                차.get("색상", ""), 차.get("사고여부", ""), 차.get("번호판", ""),
-                차.get("지역", ""), 차.get("판매자", ""), 차.get("연락처", ""),
-                차.get("사진URL", ""), 차.get("상세링크", ""), 원본,
-                번호
-            ))
+            if 사진JSON:
+                db.execute("""
+                    UPDATE 차량
+                    SET 최근확인=?, 상태='등록중', 사라진날=NULL,
+                        차종=?, 가격=?, 연식=?, 주행거리=?, 연료=?, 변속기=?,
+                        색상=?, 사고여부=?, 번호판=?, 지역=?, 판매자=?, 연락처=?,
+                        사진URL=?, 사진URL들=?, 상세링크=?, 원본데이터=?
+                    WHERE 차량번호=?
+                """, (
+                    지금,
+                    차.get("차종", ""), 차.get("가격", ""), 차.get("연식", ""),
+                    차.get("주행거리", ""), 차.get("연료", ""), 차.get("변속기", ""),
+                    차.get("색상", ""), 차.get("사고여부", ""), 차.get("번호판", ""),
+                    차.get("지역", ""), 차.get("판매자", ""), 차.get("연락처", ""),
+                    차.get("사진URL", ""), 사진JSON, 차.get("상세링크", ""), 원본,
+                    번호
+                ))
+            else:
+                db.execute("""
+                    UPDATE 차량
+                    SET 최근확인=?, 상태='등록중', 사라진날=NULL,
+                        차종=?, 가격=?, 연식=?, 주행거리=?, 연료=?, 변속기=?,
+                        색상=?, 사고여부=?, 번호판=?, 지역=?, 판매자=?, 연락처=?,
+                        사진URL=?, 상세링크=?, 원본데이터=?
+                    WHERE 차량번호=?
+                """, (
+                    지금,
+                    차.get("차종", ""), 차.get("가격", ""), 차.get("연식", ""),
+                    차.get("주행거리", ""), 차.get("연료", ""), 차.get("변속기", ""),
+                    차.get("색상", ""), 차.get("사고여부", ""), 차.get("번호판", ""),
+                    차.get("지역", ""), 차.get("판매자", ""), 차.get("연락처", ""),
+                    차.get("사진URL", ""), 차.get("상세링크", ""), 원본,
+                    번호
+                ))
         else:
             db.execute("""
                 INSERT INTO 차량
                 (차량번호,차종,가격,연식,주행거리,연료,변속기,색상,사고여부,
-                 번호판,지역,판매자,연락처,사진URL,상세링크,원본데이터,
+                 번호판,지역,판매자,연락처,사진URL,사진URL들,상세링크,원본데이터,
                  최초발견,최근확인,상태)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'등록중')
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'등록중')
             """, (
                 번호,
                 차.get("차종", ""), 차.get("가격", ""), 차.get("연식", ""),
                 차.get("주행거리", ""), 차.get("연료", ""), 차.get("변속기", ""),
                 차.get("색상", ""), 차.get("사고여부", ""), 차.get("번호판", ""),
                 차.get("지역", ""), 차.get("판매자", ""), 차.get("연락처", ""),
-                차.get("사진URL", ""), 차.get("상세링크", ""), 원본,
+                차.get("사진URL", ""), 사진JSON, 차.get("상세링크", ""), 원본,
                 지금, 지금
             ))
             신규 += 1
@@ -352,11 +384,9 @@ def 브라우저_열기():
     서비스 = Service(ChromeDriverManager().install())
     드라이버 = webdriver.Chrome(service=서비스, options=옵션)
 
-    # 모든 새 페이지에 XHR 가로채기 스크립트 주입
     드라이버.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": """
         window.__captured = [];
 
-        // XMLHttpRequest 가로채기
         (function() {
             var _open = XMLHttpRequest.prototype.open;
             var _send = XMLHttpRequest.prototype.send;
@@ -383,7 +413,6 @@ def 브라우저_열기():
             };
         })();
 
-        // fetch 가로채기
         (function() {
             var _fetch = window.fetch;
             if (!_fetch) return;
@@ -438,7 +467,6 @@ def 로그인(드라이버, 아이디, 비밀번호):
     드라이버.get(f"{사이트}/User/Login")
     time.sleep(3)
 
-    # alert 처리 (혹시 있으면)
     alert_처리(드라이버)
 
     try:
@@ -457,7 +485,6 @@ def 로그인(드라이버, 아이디, 비밀번호):
     pw_input.clear()
     pw_input.send_keys(비밀번호)
 
-    # 로그인 버튼 클릭
     try:
         for btn in 드라이버.find_elements(By.TAG_NAME, "button"):
             if "로그인" in btn.text:
@@ -471,7 +498,6 @@ def 로그인(드라이버, 아이디, 비밀번호):
 
     time.sleep(3)
 
-    # alert 처리
     msg = alert_처리(드라이버)
     if msg:
         print(f"  알림: {msg}")
@@ -488,7 +514,6 @@ def 로그인(드라이버, 아이디, 비밀번호):
 # 데이터 추출 — 전략 1: 가로챈 API 응답에서 추출
 # ════════════════════════════════════════════════════════════
 def API_응답에서_차량_추출(응답들):
-    """가로챈 XHR/fetch 응답에서 차량 데이터 추출"""
     차량들 = []
 
     for resp in 응답들:
@@ -497,16 +522,13 @@ def API_응답에서_차량_추출(응답들):
         if not body:
             continue
 
-        # JSON 응답 파싱 시도
         try:
             data = json.loads(body)
         except (json.JSONDecodeError, TypeError):
-            # HTML 응답일 수도 있음 — 나중에 HTML 파싱으로 처리
             if "<table" in body.lower() or "<tr" in body.lower():
                 차량들.extend(HTML에서_차량_추출(body))
             continue
 
-        # JSON 구조에서 차량 목록 찾기
         found = _JSON에서_차량_찾기(data)
         차량들.extend(found)
 
@@ -514,7 +536,6 @@ def API_응답에서_차량_추출(응답들):
 
 
 def _JSON에서_차량_찾기(data, depth=0):
-    """JSON 데이터에서 차량 목록 재귀 탐색"""
     if depth > 5:
         return []
 
@@ -523,7 +544,6 @@ def _JSON에서_차량_찾기(data, depth=0):
     if isinstance(data, list):
         for item in data:
             if isinstance(item, dict):
-                # 차량 데이터인지 확인 (EnCarNo 또는 차량 관련 필드 존재)
                 keys = set(item.keys())
                 차량_필드 = {"EnCarNo", "CarModelName", "CarAmountSale", "CarRegYear",
                            "CarUseKm", "CarFuel", "CarMission", "CarPlateNumber"}
@@ -533,13 +553,11 @@ def _JSON에서_차량_찾기(data, depth=0):
                     차량들.extend(_JSON에서_차량_찾기(item, depth + 1))
 
     elif isinstance(data, dict):
-        # 차량 데이터 직접 확인
         keys = set(data.keys())
         차량_필드 = {"EnCarNo", "CarModelName", "CarAmountSale"}
         if keys & 차량_필드:
             차량들.append(_JSON_차량_변환(data))
         else:
-            # 하위 필드 탐색
             for v in data.values():
                 if isinstance(v, (dict, list)):
                     차량들.extend(_JSON에서_차량_찾기(v, depth + 1))
@@ -548,7 +566,6 @@ def _JSON에서_차량_찾기(data, depth=0):
 
 
 def _JSON_차량_변환(item):
-    """카매니저 JSON 필드 → 한글 필드 매핑"""
     사진 = item.get("CarThumb", "") or item.get("CarPhoto", "") or ""
     if 사진 and not 사진.startswith("http"):
         사진 = urljoin(사이트, 사진)
@@ -581,7 +598,6 @@ def _JSON_차량_변환(item):
 # 데이터 추출 — HTML 파싱 (카매니저 전용)
 # ════════════════════════════════════════════════════════════
 def HTML에서_차량_추출(html):
-    """카매니저 HTML 테이블에서 차량 목록 추출 (tr.uc_carcss 기반)"""
     soup = BeautifulSoup(html, "html.parser")
     차량들 = []
 
@@ -589,7 +605,6 @@ def HTML에서_차량_추출(html):
         차 = {}
         tds = row.select("td")
 
-        # 차량번호 (checkbox value = 암호화 ID)
         cb = row.select_one("input[type='checkbox']")
         if cb:
             차["차량번호"] = cb.get("value", "")
@@ -600,7 +615,6 @@ def HTML에서_차량_추출(html):
         if not 차.get("차량번호"):
             continue
 
-        # 사진 URL
         img = row.select_one("img.thumbnail")
         if img:
             src = img.get("src", "")
@@ -608,46 +622,38 @@ def HTML에서_차량_추출(html):
         else:
             차["사진URL"] = ""
 
-        # 차종 = [제조사] 모델명
         maker = row.select_one("label.uc_carmaker")
         model_a = row.select_one("td.uc_textleft a")
         제조사 = maker.get_text(strip=True) if maker else ""
         모델명 = model_a.get_text(strip=True) if model_a else ""
         차["차종"] = f"{제조사} {모델명}".strip()
 
-        # 상세링크
         if model_a:
             onclick = model_a.get("onclick", "") or ""
             m = re.search(r"['\"]([A-Za-z0-9+/=]{10,})['\"]", onclick)
             if m:
                 차["상세링크"] = f"{사이트}/Car/Detail/{m.group(1)}"
 
-        # 연식 (span.uc_carreg)
         reg = row.select_one("span.uc_carreg")
         if reg:
             차["연식"] = reg.get_text(strip=True)
 
-        # 주행거리 (td.uc_carusekm)
         km = row.select_one(".uc_carusekm")
         if km:
             차["주행거리"] = km.get_text(strip=True)
 
-        # 색상 (td.uc_carcolor)
         color = row.select_one(".uc_carcolor")
         if color:
             차["색상"] = color.get_text(strip=True)
 
-        # 가격 (b.uc_caramount)
         amount = row.select_one(".uc_caramount")
         if amount:
             차["가격"] = amount.get_text(strip=True) + "만원"
 
-        # 지역 (td.uc_cararea)
         area = row.select_one(".uc_cararea")
         if area:
             차["지역"] = " ".join(area.get_text(strip=True).split())
 
-        # 판매자 / 연락처
         dealer = row.select_one("span.uc_cardealer")
         if dealer:
             차["판매자"] = dealer.get_text(strip=True)
@@ -655,18 +661,15 @@ def HTML에서_차량_추출(html):
         if phone:
             차["연락처"] = phone.get_text(strip=True)
 
-        # 번호판 (span.uc_carreg_year — 첫 번째가 번호판 4자리)
         plates = row.select("span.uc_carreg_year")
         if plates:
             차["번호판"] = plates[0].get_text(strip=True)
 
-        # 변속기 (5번째 td의 첫 p)
         if len(tds) >= 5:
             mission_p = tds[4].select_one("p")
             if mission_p:
                 차["변속기"] = mission_p.get_text(strip=True)
 
-        # 연료 (7번째 td)
         if len(tds) >= 7:
             차["연료"] = tds[6].get_text(strip=True)
 
@@ -682,7 +685,6 @@ def _검색_초기화(드라이버, 아이디, 비밀번호):
     """검색 필터 초기화 + 페이지당 50건 설정"""
     print("  검색 조건 초기화 중...")
 
-    # 디버깅: 초기화 전 상태
     상태 = 드라이버.execute_script("""
         var r = {};
         r.PTC = (typeof PageTCount !== 'undefined') ? PageTCount : 'N/A';
@@ -705,7 +707,6 @@ def _검색_초기화(드라이버, 아이디, 비밀번호):
     if 상태.get('t'):
         print(f"  [전] text: {상태['t']}")
 
-    # 1단계: 셀렉트 옵션 디버깅 출력 + 전체 초기화
     셀렉트_정보 = 드라이버.execute_script("""
         var info = [];
         document.querySelectorAll('select').forEach(function(s){
@@ -721,8 +722,6 @@ def _검색_초기화(드라이버, 아이디, 비밀번호):
     for s in (셀렉트_정보 or []):
         print(f"  [select] {s}")
 
-    # text input만 비우기 + select "전체" + 50건 (사이트 최대)
-    # hidden은 비우지 않음 (PageTCount 등 서버 값 보존)
     드라이버.execute_script("""
         document.querySelectorAll('input[type="text"]').forEach(function(i){ i.value=''; });
 
@@ -755,7 +754,6 @@ def _검색_초기화(드라이버, 아이디, 비밀번호):
     """)
     time.sleep(1)
 
-    # 2단계: 검색 실행
     try:
         method = 드라이버.execute_script("""
             if (typeof goFormSubmitType === 'function') { goFormSubmitType(); return 'goFormSubmitType'; }
@@ -773,7 +771,6 @@ def _검색_초기화(드라이버, 아이디, 비밀번호):
     time.sleep(5)
     alert_처리(드라이버)
 
-    # 3단계: 검색 후 디버깅
     상태2 = 드라이버.execute_script("""
         var r = {};
         r.PTC = (typeof PageTCount !== 'undefined') ? PageTCount : 'N/A';
@@ -792,7 +789,6 @@ def _검색_초기화(드라이버, 아이디, 비밀번호):
     if 상태2.get('h'):
         print(f"  [후] hidden: {상태2['h']}")
 
-    # 0건이면 쿠키 삭제 + 재로그인 + 재시도
     if rows == 0:
         print("  0건 → 쿠키 삭제 후 재로그인...")
         드라이버.delete_all_cookies()
@@ -855,7 +851,6 @@ def 전체_수집(드라이버, 아이디, 비밀번호):
     가로챈_응답_비우기(드라이버)
     드라이버.get(f"{사이트}/Car/Data")
 
-    # alert 처리
     for _ in range(3):
         time.sleep(2)
         msg = alert_처리(드라이버)
@@ -864,26 +859,21 @@ def 전체_수집(드라이버, 아이디, 비밀번호):
 
     time.sleep(3)
 
-    # 이전 검색 조건 초기화 (번호판 필터 등 제거)
     _검색_초기화(드라이버, 아이디, 비밀번호)
 
-    # 첫 페이지 소스 저장
     with open("페이지_소스.html", "w", encoding="utf-8") as f:
         f.write(드라이버.page_source)
     print("  페이지 소스 저장 완료 (페이지_소스.html)")
 
-    # 총 페이지 수 확인
     총_페이지 = _총_페이지_수(드라이버)
     if 최대_페이지 > 0:
         총_페이지 = min(총_페이지, 최대_페이지)
     print(f"\n  수집 대상: {총_페이지} 페이지\n")
 
-    # 페이지별 수집
     for p in range(1, 총_페이지 + 1):
         print(f"  [{p:>4}/{총_페이지}] ", end="", flush=True)
 
         if p > 1:
-            # 사람처럼 랜덤 딜레이 (봇 감지 방지)
             대기 = random.uniform(3, 7)
             if p % 10 == 0:
                 대기 = random.uniform(10, 20)
@@ -904,7 +894,6 @@ def 전체_수집(드라이버, 아이디, 비밀번호):
             time.sleep(random.uniform(2, 4))
             alert_처리(드라이버)
 
-        # HTML 파싱으로 추출 (카매니저는 서버 렌더링)
         차량들 = HTML에서_차량_추출(드라이버.page_source)
 
         if 차량들:
@@ -920,7 +909,6 @@ def 전체_수집(드라이버, 아이디, 비밀번호):
 
 
 def _총_페이지_수(드라이버):
-    """페이지네이션 정보에서 총 페이지 수 추출"""
     try:
         result = 드라이버.execute_script("""
             // 방법 1: 전역 변수
@@ -954,7 +942,6 @@ def _총_페이지_수(드라이버):
                     var n = parseInt(m[1]);
                     if (n > max) max = n;
                 }
-                // href에 page 파라미터
                 var href = a.getAttribute('href') || '';
                 m = href.match(/[Pp]age[=:](\\d+)/);
                 if (m) {
@@ -970,6 +957,139 @@ def _총_페이지_수(드라이버):
 
 
 # ════════════════════════════════════════════════════════════
+# 상세 사진 수집 (차량별 여러 장)
+# ════════════════════════════════════════════════════════════
+def 상세_사진_수집(드라이버, 차량_목록):
+    """각 차량 상세 페이지에서 사진 여러 장 수집 (배치 단위)"""
+
+    # 이미 사진을 수집한 차량 제외
+    수집완료 = set()
+    db = DB_연결()
+    try:
+        rows = db.execute(
+            "SELECT 차량번호 FROM 차량 WHERE 사진URL들 IS NOT NULL AND 사진URL들 != '' AND 사진URL들 != '[]'"
+        ).fetchall()
+        수집완료 = {r["차량번호"] for r in rows}
+    except Exception:
+        pass
+    db.close()
+
+    대상 = [차 for 차 in 차량_목록 if 차.get("상세링크") and 차.get("차량번호") not in 수집완료]
+
+    if not 대상:
+        print("\n  상세 사진: 모든 차량 수집 완료 (건너뜀)")
+        return
+
+    배치 = 대상[:상세_사진_배치]
+    남은 = len(대상) - len(배치)
+    print(f"\n  상세 사진 수집: {len(배치)}대 (미수집 {len(대상)}대 중, 나머지 {남은}대는 다음 실행)")
+
+    수집_성공 = 0
+    총_장수 = 0
+
+    for i, 차 in enumerate(배치):
+        링크 = 차.get("상세링크", "")
+        번호 = 차.get("차량번호", "")
+        차종 = 차.get("차종", "?")
+        if len(차종) > 20:
+            차종 = 차종[:20]
+        print(f"  [{i+1:>4}/{len(배치)}] {차종:20s} ", end="", flush=True)
+
+        if i > 0:
+            대기 = random.uniform(2, 5)
+            if (i + 1) % 20 == 0:
+                대기 = random.uniform(8, 15)
+                print(f"(쉬는 중 {대기:.0f}초) ", end="", flush=True)
+            time.sleep(대기)
+
+        try:
+            드라이버.get(링크)
+            time.sleep(random.uniform(2, 4))
+            alert_처리(드라이버)
+
+            사진들 = 드라이버.execute_script("""
+                var photos = [];
+                var seen = {};
+
+                document.querySelectorAll('img').forEach(function(img) {
+                    var src = img.src || img.getAttribute('data-src') || img.getAttribute('data-original') || '';
+                    if (!src || src.indexOf('noimage') !== -1) return;
+                    if (src.indexOf('logo') !== -1 || src.indexOf('icon') !== -1) return;
+                    if (src.indexOf('btn_') !== -1 || src.indexOf('bg_') !== -1) return;
+                    if (src.indexOf('banner') !== -1 || src.indexOf('footer') !== -1) return;
+                    if (src.indexOf('/Upload/') !== -1 || src.indexOf('/CarPhoto/') !== -1 ||
+                        src.indexOf('/photo/') !== -1 || src.indexOf('/Photo/') !== -1 ||
+                        src.indexOf('/img/car') !== -1 || src.indexOf('/images/car') !== -1) {
+                        if (!seen[src]) { seen[src] = true; photos.push(src); }
+                    }
+                    else if (img.naturalWidth > 150 && img.naturalHeight > 100) {
+                        if (!seen[src]) { seen[src] = true; photos.push(src); }
+                    }
+                });
+
+                document.querySelectorAll('a[href]').forEach(function(a) {
+                    var href = a.href || '';
+                    if (href.match(/\\.(jpg|jpeg|png|webp|gif)/i) &&
+                        (href.indexOf('/Upload/') !== -1 || href.indexOf('/CarPhoto/') !== -1 ||
+                         href.indexOf('/photo/') !== -1 || href.indexOf('/Photo/') !== -1)) {
+                        if (!seen[href]) { seen[href] = true; photos.push(href); }
+                    }
+                });
+
+                document.querySelectorAll('[style*="background"]').forEach(function(el) {
+                    var style = window.getComputedStyle(el).backgroundImage || el.style.backgroundImage || '';
+                    var m = style.match(/url\\(['"]?(.*?)['"]?\\)/);
+                    if (m && m[1]) {
+                        var src = m[1];
+                        if (src.indexOf('noimage') === -1 && !seen[src] &&
+                            (src.indexOf('/Upload/') !== -1 || src.indexOf('/CarPhoto/') !== -1 ||
+                             src.indexOf('/photo/') !== -1 || src.indexOf('/Photo/') !== -1)) {
+                            seen[src] = true;
+                            photos.push(src);
+                        }
+                    }
+                });
+
+                return photos;
+            """) or []
+
+            차["사진URL들"] = 사진들
+
+            if 사진들:
+                수집_성공 += 1
+                총_장수 += len(사진들)
+                print(f"사진 {len(사진들)}장")
+
+                # 즉시 DB에 저장 (다음 실행에서 건너뛰도록)
+                db = DB_연결()
+                db.execute(
+                    "UPDATE 차량 SET 사진URL들=? WHERE 차량번호=?",
+                    (json.dumps(사진들, ensure_ascii=False), 번호)
+                )
+                db.commit()
+                db.close()
+
+                # Supabase에도 즉시 저장
+                if supabase_client:
+                    try:
+                        supabase_client.table("car_listings").update({
+                            "photo_urls": json.dumps(사진들, ensure_ascii=False)
+                        }).eq("car_id", 번호).execute()
+                    except Exception:
+                        pass
+            else:
+                print("사진 없음")
+
+        except Exception as e:
+            차["사진URL들"] = []
+            print(f"실패 ({str(e)[:50]})")
+
+    print(f"\n  상세 사진 완료: {수집_성공}대에서 총 {총_장수}장 수집")
+    if 남은 > 0:
+        print(f"  남은 {남은}대는 다음 실행에서 계속")
+
+
+# ════════════════════════════════════════════════════════════
 # 사진 다운로드
 # ════════════════════════════════════════════════════════════
 def 사진_다운로드(차량_목록):
@@ -980,30 +1100,41 @@ def 사진_다운로드(차량_목록):
     실패 = 0
 
     for 차 in 차량_목록:
-        url = 차.get("사진URL", "")
-        if not url or not url.startswith("http"):
-            continue
-
-        확장자 = ".jpg"
-        if ".png" in url.lower():
-            확장자 = ".png"
-        elif ".webp" in url.lower():
-            확장자 = ".webp"
-
         안전_이름 = re.sub(r'[\\/:*?"<>|]', "_", 차.get("차량번호", "unknown"))
-        경로 = os.path.join(사진_폴더, f"{안전_이름}{확장자}")
 
-        if os.path.exists(경로):
-            continue
+        # 상세 사진 여러 장 우선, 없으면 썸네일 1장
+        urls = 차.get("사진URL들", [])
+        if not urls:
+            url = 차.get("사진URL", "")
+            if url and url.startswith("http"):
+                urls = [url]
 
-        try:
-            r = 세션.get(url, timeout=15)
-            if r.status_code == 200 and len(r.content) > 500:
-                with open(경로, "wb") as f:
-                    f.write(r.content)
-                다운 += 1
-        except Exception:
-            실패 += 1
+        for idx, url in enumerate(urls):
+            if not url or not url.startswith("http"):
+                continue
+
+            확장자 = ".jpg"
+            if ".png" in url.lower():
+                확장자 = ".png"
+            elif ".webp" in url.lower():
+                확장자 = ".webp"
+
+            if len(urls) > 1:
+                경로 = os.path.join(사진_폴더, f"{안전_이름}_{idx+1}{확장자}")
+            else:
+                경로 = os.path.join(사진_폴더, f"{안전_이름}{확장자}")
+
+            if os.path.exists(경로):
+                continue
+
+            try:
+                r = 세션.get(url, timeout=15)
+                if r.status_code == 200 and len(r.content) > 500:
+                    with open(경로, "wb") as f:
+                        f.write(r.content)
+                    다운 += 1
+            except Exception:
+                실패 += 1
 
     return 다운, 실패
 
@@ -1054,14 +1185,23 @@ def 메인():
     print("  │     카매니저 매물 확인 프로그램      │")
     print("  ├────────────────────────────────────┤")
     print("  │  - 전체 매물 정보 수집              │")
-    print("  │  - 차량 사진 다운로드               │")
+    print("  │  - 차량 사진 다운로드 (여러 장)      │")
     print("  │  - 사라진 매물 자동 감지            │")
     print("  └────────────────────────────────────┘")
     print()
 
-    # 아이디/비번 입력
-    아이디 = input("  카매니저 아이디: ").strip()
-    비밀번호 = getpass.getpass("  카매니저 비밀번호: ").strip()
+    # 아이디/비번 — 환경변수 우선, 없으면 직접 입력
+    아이디 = os.environ.get("CM_ID", "").strip()
+    비밀번호 = os.environ.get("CM_PW", "").strip()
+    if 아이디 and 비밀번호:
+        print(f"  계정: {아이디} (환경변수)")
+    else:
+        if HEADLESS:
+            print("  .env에 CM_ID, CM_PW가 없습니다. 자동 실행 불가.")
+            return
+        아이디 = input("  카매니저 아이디: ").strip()
+        비밀번호 = getpass.getpass("  카매니저 비밀번호: ").strip()
+
     if not 아이디 or not 비밀번호:
         print("  아이디와 비밀번호를 입력해주세요.")
         return
@@ -1073,7 +1213,6 @@ def 메인():
     드라이버 = 브라우저_열기()
 
     try:
-        # 로그인
         print("  카매니저 로그인 중...")
         if not 로그인(드라이버, 아이디, 비밀번호):
             return
@@ -1083,7 +1222,8 @@ def 메인():
         if not 차량_목록:
             print("\n  차량 데이터를 추출하지 못했습니다.")
             print("  '페이지_소스.html' 파일을 확인해주세요.")
-            input("\n  엔터를 누르면 종료...")
+            if not HEADLESS:
+                input("\n  엔터를 누르면 종료...")
             return
 
         print(f"\n  === 수집 완료: {len(차량_목록)}대 ===")
@@ -1099,6 +1239,9 @@ def 메인():
         print(f"  신규 등록: {신규}대")
         if 사라진 > 0:
             print(f"  사라진 매물: {사라진}대 (팔렸거나 내려감)")
+
+        # 상세 사진 수집 (차량별 여러 장, 배치 단위)
+        상세_사진_수집(드라이버, 차량_목록)
 
         # 사진 다운로드
         print("\n  사진 다운로드 중...")
@@ -1120,15 +1263,17 @@ def 메인():
         # 샘플 출력
         print("\n  --- 최근 수집 샘플 (최대 5대) ---")
         for 차 in 차량_목록[:5]:
+            사진수 = len(차.get("사진URL들", []))
             print(f"  {차.get('차종','?'):20s}  {차.get('가격','?'):>10s}"
                   f"  {차.get('연식','?'):>6s}  {차.get('주행거리','?'):>10s}"
-                  f"  {차.get('지역','?')}")
+                  f"  {차.get('지역','?')}  사진:{사진수}장")
 
     finally:
         드라이버.quit()
 
     print("\n  완료!")
-    input("  엔터를 누르면 종료...")
+    if not HEADLESS:
+        input("  엔터를 누르면 종료...")
 
 
 if __name__ == "__main__":
