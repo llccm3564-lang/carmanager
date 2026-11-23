@@ -2185,7 +2185,12 @@ def 사진_다운로드(차량_목록):
                 경로 = os.path.join(사진_폴더, f"{안전_이름}{확장자}")
 
             if os.path.exists(경로):
-                continue
+                # 예전에 받은 미리보기(_TH, 약 6KB)면 원본으로 다시 받음. 원본은 수십 KB
+                try:
+                    if "_TH." in url or os.path.getsize(경로) >= 20000:
+                        continue
+                except OSError:
+                    continue
 
             try:
                 r = 세션.get(url, timeout=15)
