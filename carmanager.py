@@ -72,37 +72,136 @@ try:
 except Exception:
     pass
 
-# ── 종료 시 로그를 Supabase에 자동 업로드 ──
+# ── 로그를 Supabase에 실시간으로 올리기 ──
+# 예전: 끝날 때 한 번만 올림 → 강제 종료·긴 실행이면 아무것도 안 보였음.
+# 지금: 1분마다 새로 생긴 줄만 error_logs 에 새 행으로 추가 (표는 추가·읽기만 허용이라 수정 대신 추가).
+#   pc_name = "PC이름|실행ID|순번"  (마지막 조각은 "|끝")  → 같은 실행ID 를 순번대로 이어 붙이면 전체 로그
+#   새 줄이 5분 넘게 없으면 "(진행 중 …)" 행을 올려 살아 있는지 알림.
+#   정상 종료·Ctrl+C·창 닫기 때도 남은 부분을 올림.
 import atexit
+import threading
 
-def _upload_log_to_supabase():
+_로그_실행ID = datetime.now().strftime("%m%d-%H%M%S")
+_로그_PC = os.environ.get("COMPUTERNAME", "unknown")
+_로그_위치 = 0          # log.txt 에서 이미 올린 바이트 위치
+_로그_순번 = 0
+_로그_마지막전송 = time.time()
+_로그_잠금 = threading.Lock()
+_로그_끝냄 = False
+
+
+def _로그_행_추가(내용, 끝=False):
+    """error_logs 에 한 행 추가. 성공하면 True."""
+    global _로그_순번
+    url = os.environ.get("SUPABASE_URL", "")
+    key = os.environ.get("SUPABASE_KEY", "")
+    if not url or not key:
+        return False
+    표시 = f"{_로그_PC}|{_로그_실행ID}|{_로그_순번:03d}" + ("|끝" if 끝 else "")
     try:
-        _log_file.flush()
-        log_content = open(_log_path, "r", encoding="utf-8").read()
-        if not log_content.strip():
-            return
-        url = os.environ.get("SUPABASE_URL", "")
-        key = os.environ.get("SUPABASE_KEY", "")
-        if not url or not key:
-            return
-        requests.post(
+        r = requests.post(
             f"{url}/rest/v1/error_logs",
-            headers={
-                "apikey": key,
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json",
-                "Prefer": "return=minimal"
-            },
-            json={
-                "content": log_content[-50000:],
-                "pc_name": os.environ.get("COMPUTERNAME", "unknown")
-            },
-            timeout=10
+            headers={"apikey": key, "Authorization": f"Bearer {key}",
+                     "Content-Type": "application/json", "Prefer": "return=minimal"},
+            json={"content": 내용, "pc_name": 표시},
+            timeout=15,
         )
+        if r.status_code in (200, 201, 204):
+            _로그_순번 += 1
+            return True
+        sys.__stderr__.write(f"  [로그 올리기 실패] 상태={r.status_code} {r.text[:200]}\n")
+    except Exception as e:
+        try:
+            sys.__stderr__.write(f"  [로그 올리기 실패] {str(e)[:200]}\n")
+        except Exception:
+            pass
+    return False
+
+
+def _로그_보내기(끝=False):
+    """log.txt 에서 아직 안 올린 부분을 올린다. 실패하면 위치를 그대로 둬서 다음에 다시 올림."""
+    global _로그_위치, _로그_마지막전송, _로그_끝냄
+    if not _로그_잠금.acquire(timeout=20):
+        return
+    try:
+        if _로그_끝냄:
+            return
+        try:
+            _log_file.flush()
+        except Exception:
+            pass
+        try:
+            with open(_log_path, "rb") as f:
+                f.seek(_로그_위치)
+                새것 = f.read()
+        except Exception:
+            새것 = b""
+        if not 끝:
+            # 줄 중간(한글 글자 중간)에서 자르지 않게 마지막 줄바꿈까지만
+            k = 새것.rfind(b"\n")
+            새것 = 새것[:k + 1] if k >= 0 else b""
+        if 새것:
+            # 한 행에 약 100KB 까지, 가능하면 줄바꿈에서 자름 (바이트 단위로 세서 위치가 어긋나지 않게)
+            pos = 0
+            while pos < len(새것):
+                끝위치 = min(pos + 100000, len(새것))
+                if 끝위치 < len(새것):
+                    k = 새것.rfind(b"\n", pos, 끝위치)
+                    if k > pos:
+                        끝위치 = k + 1
+                    else:
+                        # 줄바꿈이 없으면 한글 글자(UTF-8 여러 바이트) 중간이 아닌 곳에서 자름
+                        while 끝위치 > pos + 1 and (새것[끝위치] & 0xC0) == 0x80:
+                            끝위치 -= 1
+                조각 = 새것[pos:끝위치]
+                마지막 = 끝 and 끝위치 >= len(새것)
+                if not _로그_행_추가(조각.decode("utf-8", errors="replace"), 끝=마지막):
+                    return
+                _로그_위치 += len(조각)
+                pos = 끝위치
+            _로그_마지막전송 = time.time()
+        elif 끝:
+            _로그_행_추가("(실행 끝)", 끝=True)
+        elif time.time() - _로그_마지막전송 > 300:
+            if _로그_행_추가(f"  (진행 중 — 새 줄 없음 {int((time.time() - _로그_마지막전송) // 60)}분, "
+                             f"{datetime.now().strftime('%H:%M:%S')})"):
+                _로그_마지막전송 = time.time()
+        if 끝:
+            _로그_끝냄 = True
+    finally:
+        _로그_잠금.release()
+
+
+def _로그_주기적_보내기():
+    time.sleep(10)  # 시작 직후 한 번 (실행이 시작됐는지 바로 보이게)
+    while not _로그_끝냄:
+        _로그_보내기()
+        time.sleep(60)
+
+
+threading.Thread(target=_로그_주기적_보내기, daemon=True).start()
+atexit.register(lambda: _로그_보내기(끝=True))
+
+# 창 닫기·로그오프·Ctrl+Break 때도 남은 로그 올리기 (윈도우 콘솔 신호)
+if os.name == "nt":
+    try:
+        import ctypes
+        _콘솔처리기형 = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
+
+        def _콘솔신호(신호):
+            # 0=Ctrl+C 는 파이썬이 KeyboardInterrupt 로 처리 → 정상 종료 경로(atexit)로 올라감
+            if 신호 in (1, 2, 5, 6):  # Ctrl+Break, 창 닫기, 로그오프, 시스템 종료
+                try:
+                    print(f"\n  [종료 신호 {신호}] 남은 로그 올리는 중...")
+                    _로그_보내기(끝=True)
+                except Exception:
+                    pass
+            return False
+
+        _콘솔처리기 = _콘솔처리기형(_콘솔신호)  # 참조 유지 (지우면 처리기가 사라짐)
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(_콘솔처리기, True)
     except Exception:
         pass
-
-atexit.register(_upload_log_to_supabase)
 
 try:
     from supabase import create_client
