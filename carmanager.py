@@ -2133,6 +2133,12 @@ def 상세_사진_수집(드라이버, 차량_목록, 최대=None):
                         doc.querySelectorAll('script[src]').forEach(function(s){ out.scripts.push(s.getAttribute('src')); });
                         var fns = res.html.match(/function\\s+\\w*(?:[Pp]erform|[Cc]heck|[Ii]nspect|[Rr]ecord)\\w*\\s*\\([^)]*\\)\\s*\\{[\\s\\S]{0,400}/g) || [];
                         out.fns = fns.slice(0, 5);
+                        // 성능기록부를 추가로 찾는 carCheckOut 코드 (상세 페이지 안에만 있음) 앞뒤
+                        out.checkoutCode = [];
+                        ['carCheckOut', 'carcheckoutUrl', 'NewGubun', 'ChkSeq', 'CarOnCarNo'].forEach(function(k){
+                            var i = res.html.indexOf(k);
+                            if (i >= 0) out.checkoutCode.push(k + ' @' + i + ': ' + res.html.substring(Math.max(0, i - 150), i + 900));
+                        });
                     }
                     done(out);
                 }).catch(function(e){ done({error: String(e)}); });
@@ -2155,6 +2161,9 @@ def 상세_사진_수집(드라이버, 차량_목록, 최대=None):
                 print(f"  [상세 구조] 표 항목: {list(상세.get('perf', {}).get('info', {}).keys())[:40]}")
                 print(f"  [상세 구조] 스크립트: {상세.get('scripts')}")
                 print(f"  [상세 구조] 관련 함수: {json.dumps(상세.get('fns'), ensure_ascii=False)[:1500]}")
+                for 조각 in (상세.get("checkoutCode") or []):
+                    print(f"  [상세 구조] 기록부 코드 {' '.join(조각.split())[:1100]}")
+                print(f"  [상세 구조] 기록부 위치 값: {json.dumps(상세.get('perf', {}).get('checkout') or {}, ensure_ascii=False)}")
                 print(f"  [상세 구조] 본문: {상세.get('text')}")
                 print(f"  [{i+1:>4}/{len(배치)}] {차종:20s} ", end="", flush=True)
 
