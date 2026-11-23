@@ -776,6 +776,15 @@ def _검색_초기화(드라이버, 아이디, 비밀번호):
     드라이버.execute_script("""
         document.querySelectorAll('input[type="text"]').forEach(function(i){ i.value=''; });
 
+        // 지역/단지 hidden 필드 초기화 (핵심: 이게 남아있으면 특정 지역만 검색됨)
+        var clearHiddens = ['cbxSearchDanji','cbxSearchSiDo','cbxSearchSiDoArea',
+                            'hdfDefaultCity','hdfDefaultDanji','hdfDefaultSido',
+                            'fristSetCity','fristSetSido'];
+        clearHiddens.forEach(function(name) {
+            var el = document.querySelector('input[name="'+name+'"]');
+            if (el) el.value = '';
+        });
+
         document.querySelectorAll('select').forEach(function(s){
             if (!s.name || s.name==='sbxPageRowCount') return;
             var found = false;
