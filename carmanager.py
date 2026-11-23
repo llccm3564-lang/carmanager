@@ -127,6 +127,9 @@ DB_파일 = "매물_데이터.db"
 검색_시도 = os.getenv("CM_SIDO", "103")
 검색_지역 = os.getenv("CM_AREA", "1038")
 검색_단지 = os.getenv("CM_DANJI", "96502")
+
+# 목록을 끝 페이지까지 다 받았을 때만 True → 이때만 「사라짐」 처리 (중간에 끊기면 멀쩡한 차가 사라짐으로 찍힘)
+목록_완료 = False
 HEADLESS = "--headless" in sys.argv
 
 # Supabase (.env 파일에서 읽음)
@@ -992,48 +995,87 @@ def _검색_초기화(드라이버, 아이디, 비밀번호):
     print(f"  검색 초기화 완료 (현재 {rows}건 표시)")
 
 
-def 전체_수집(드라이버, 아이디, 비밀번호):
-    전체 = []
+def _목록_요청(드라이버, 페이지):
+    """사이트 검색 버튼과 같은 요청을 직접 보낸다.
+    (sCarData.js reLoadJsonCarDataMulti → POST /Car/DataPart, JSON {"para": {...}})
+    화면 상자·계정 기본 단지와 상관없이 설정한 지역으로 목록 HTML 을 받는다.
+    받은 HTML 은 사이트처럼 #ui_context 에 넣어, 안의 스크립트(EncCheck·PrePage·건수 갱신)가 돌게 한다."""
+    return 드라이버.execute_async_script("""
+        var page = arguments[0], sido = arguments[1], area = arguments[2], danji = arguments[3];
+        var done = arguments[arguments.length - 1];
+        var val = function(id, d) { var el = document.getElementById(id); return (el && el.value) ? el.value.trim() : d; };
+        var para = {
+            "EncCheck": val('EncCheck', ''), "PrePage": val('PrePage', '1'),
+            "PageNow": page, "PageSize": "50",
+            "PageSort": val('sbxPageSort', '0'), "PageAscDesc": val('sbxPageAscDesc', '1'),
+            "CarMode": "0",
+            "CarSiDoNo": sido, "CarSiDoAreaNo": area, "CarDanjiNo": danji,
+            "CarMakerNo": null, "CarModelNo": null, "CarModelDetailNo": "", "CarGradeNo": "", "CarGradeDetailNo": "",
+            "CarMakeSDate": "", "CarMakeEDate": "", "CarDriveSKm": null, "CarDriveEKm": null,
+            "CarMission": "", "CarFuel": "", "CarColor": "", "CarSMoney": null, "CarEMoney": null,
+            "CarIsLPG": "False", "CarIsSago": "False", "CarIsPhoto": "False", "CarIsSaleAmount": "False",
+            "CarIsCarCheck": "False", "CarIsLeaseCheck": "False",
+            "CarName": "", "CarDealerName": "", "CarShopName": "", "CarDealerHP": "", "CarNumber": "", "CarOption": "",
+            "CarTruckTonS": "", "CarTruckTonE": ""
+        };
+        fetch('/Car/DataPart', {
+            method: 'POST', credentials: 'include', cache: 'no-store',
+            headers: {'Content-Type': 'application/json; charset=utf-8',
+                      'X-Requested-With': 'XMLHttpRequest', 'Accept': 'text/html, */*; q=0.01'},
+            body: JSON.stringify({para: para})
+        }).then(function(r) {
+            return r.text().then(function(t) {
+                var out = {status: r.status, html: t, sentEnc: para.EncCheck, sentPre: para.PrePage};
+                try {
+                    var jq = window.jQuery || window.jq351;
+                    var box = document.getElementById('ui_context');
+                    if (jq && box) { jq(box).html(t); } else { out.applyError = 'ui_context 없음'; }
+                } catch (e) { out.applyError = String(e).substring(0, 120); }
+                out.total = val('hdfCarRowCount', '');
+                out.enc = val('EncCheck', '');
+                out.pre = val('PrePage', '');
+                done(out);
+            });
+        }).catch(function(e) { done({error: String(e)}); });
+    """, 페이지, 검색_시도, 검색_지역, 검색_단지) or {}
 
-    print("  매물조회 페이지 접속 중...")
-    가로챈_응답_비우기(드라이버)
+
+def _목록_페이지_열기(드라이버):
     드라이버.get(f"{사이트}/Car/Data")
-
     for _ in range(3):
         time.sleep(2)
         msg = alert_처리(드라이버)
         if msg:
             print(f"  알림: {msg}")
-
     time.sleep(3)
+    try:
+        드라이버.set_script_timeout(60)
+    except Exception:
+        pass
 
-    _검색_초기화(드라이버, 아이디, 비밀번호)
 
-    소스 = 드라이버.page_source
-    with open("페이지_소스.html", "w", encoding="utf-8") as f:
-        f.write(소스)
-    print(f"  페이지 소스 저장 완료 ({len(소스)}자)")
+def 전체_수집(드라이버, 아이디, 비밀번호):
+    global 목록_완료
+    목록_완료 = False
+    전체 = []
+    본_번호 = set()
 
-    # 디버깅: 페이지에 uc_data 테이블이 있는지, form이 있는지
-    디버그 = 드라이버.execute_script("""
-        return {
-            hasUcData: !!document.querySelector('table.uc_data'),
-            hasForm: !!document.querySelector('form'),
-            formAction: document.querySelector('form') ? document.querySelector('form').action : 'none',
-            cookies: document.cookie.length,
-            webdriver: navigator.webdriver
-        };
-    """)
-    print(f"  [디버그] uc_data테이블={디버그.get('hasUcData')}, form={디버그.get('hasForm')}, "
-          f"쿠키길이={디버그.get('cookies')}, webdriver={디버그.get('webdriver')}")
+    print("  매물조회 페이지 접속 중...")
+    가로챈_응답_비우기(드라이버)
+    _목록_페이지_열기(드라이버)
+    print(f"  수집 지역: 시도={검색_시도} 지역={검색_지역} 단지={검색_단지} (목록 요청 /Car/DataPart 직접)")
 
-    총_페이지 = _총_페이지_수(드라이버)
-    if 최대_페이지 > 0:
-        총_페이지 = min(총_페이지, 최대_페이지)
-    print(f"\n  수집 대상: {총_페이지} 페이지\n")
-
-    for p in range(1, 총_페이지 + 1):
-        print(f"  [{p:>4}/{총_페이지}] ", end="", flush=True)
+    총_페이지 = None   # 첫 응답의 전체 건수로 정함. 못 찾으면 50대 미만 페이지가 나올 때까지
+    p = 1
+    while True:
+        if 총_페이지 is not None and p > 총_페이지:
+            목록_완료 = True
+            break
+        if 최대_페이지 > 0 and p > 최대_페이지:
+            break
+        if p > 1000:
+            print("  1000페이지 넘음 — 안전장치로 중단")
+            break
 
         # 세션 갱신: N페이지마다 쿠키 날리고 재로그인 (봇 감지 방지)
         if p > 1 and 세션_갱신_페이지 > 0 and (p - 1) % 세션_갱신_페이지 == 0:
@@ -1043,22 +1085,11 @@ def 전체_수집(드라이버, 아이디, 비밀번호):
             드라이버.delete_all_cookies()
             time.sleep(2)
             if not 로그인(드라이버, 아이디, 비밀번호):
-                print("  재로그인 실패! 기존 데이터로 계속...")
+                print("  재로그인 실패! 여기까지 모은 것만 저장")
                 break
-            드라이버.get(f"{사이트}/Car/Data")
-            time.sleep(5)
-            for _ in range(3):
-                alert_처리(드라이버)
-                time.sleep(1)
-            # 재로그인하면 계정 기본 단지로 돌아가므로 지역 다시 고정 + 50건 설정
-            드라이버.execute_script("""
-                var rs = document.querySelector('select[name="sbxPageRowCount"]');
-                if (rs) { for (var i=0;i<rs.options.length;i++){ if (rs.options[i].value==='50'){ rs.selectedIndex=i; break; } } }
-                var pr = document.querySelector('input[name="PageRow"]');
-                if (pr) pr.value = '50';
-            """)
-            _지역_고정(드라이버)
-            print(f"  [{p:>4}/{총_페이지}] ", end="", flush=True)
+            _목록_페이지_열기(드라이버)
+
+        print(f"  [{p:>4}/{총_페이지 or '?'}] ", end="", flush=True)
 
         if p > 1:
             대기 = random.uniform(8, 15)
@@ -1067,30 +1098,68 @@ def 전체_수집(드라이버, 아이디, 비밀번호):
                 print(f"(쉬는 중 {대기:.0f}초) ", end="", flush=True)
             time.sleep(대기)
 
-            try:
-                드라이버.execute_script(f"goPageSubmit({p})")
-            except Exception:
-                try:
-                    드라이버.execute_script(
-                        f"document.querySelector('input[name=\"PageNumber\"]').value={p};"
-                        f"document.querySelector('form').submit();"
-                    )
-                except Exception:
-                    print("페이지 이동 실패 — 중단")
-                    break
-            time.sleep(random.uniform(3, 6))
+        try:
+            응답 = _목록_요청(드라이버, p)
+        except Exception as e:
             alert_처리(드라이버)
+            print(f"요청 실패 ({str(e)[:120]})")
+            break
+        time.sleep(random.uniform(3, 6))  # 예전 화면 로딩 대기와 같은 간격 유지
+        alert_처리(드라이버)
 
-        차량들 = HTML에서_차량_추출(드라이버.page_source)
+        html = 응답.get("html", "") or ""
+        if 응답.get("error") or 응답.get("status") != 200:
+            앞부분 = " ".join(html.split())[:800]
+            print(f"요청 실패: 상태={응답.get('status')} 오류={응답.get('error')}")
+            print(f"  응답 앞부분: {앞부분}")
+            break
 
-        if 차량들:
-            전체.extend(차량들)
-            print(f"{len(차량들):>3}대 추출")
-        else:
+        # 응답 안 스크립트가 갱신하는 값: 전체 건수 / EncCheck
+        건수 = (re.search(r"hdfCarRowCount[\"']?\)\.val\(\s*['\"](\d+)", html)
+              or re.search(r"ui_totalcount[\"']?\)\.html\(\s*remakeNumber\(\s*['\"](\d+)", html)
+              or re.search(r"reLoadPage\(\s*['\"](\d+)['\"]", html))
+        새_enc = re.search(r"EncCheck[\"']?\)\.val\(\s*['\"]([^'\"]+)", html)
+        if 새_enc and 새_enc.group(1) != 응답.get("enc"):
+            드라이버.execute_script(
+                "var e=document.getElementById('EncCheck'); if(e) e.value=arguments[0];", 새_enc.group(1))
+
+        차량들 = HTML에서_차량_추출(html)
+
+        if p == 1:
+            with open("페이지_소스.html", "w", encoding="utf-8") as f:
+                f.write(html)
+            전체건수 = int(건수.group(1)) if 건수 else None
+            단지들 = sorted({(차.get("지역") or "")[:25] for 차 in 차량들})[:5]
+            print(f"\n  [첫 응답] 상태={응답.get('status')} 길이={len(html)} 전체건수={전체건수} "
+                  f"화면칸건수={응답.get('total')} 행={len(차량들)} 단지={단지들}")
+            print(f"  [첫 응답] 보낸 EncCheck={응답.get('sentEnc')} PrePage={응답.get('sentPre')} → "
+                  f"받은 뒤 EncCheck={응답.get('enc')} PrePage={응답.get('pre')} 적용오류={응답.get('applyError')}")
+            if 전체건수:
+                총_페이지 = max(1, -(-전체건수 // 50))
+            if not 차량들:
+                print(f"  [첫 응답] 목록 없음 — 응답 앞부분: {' '.join(html.split())[:1500]}")
+            print(f"  수집 대상: {총_페이지 if 총_페이지 else '끝날 때까지'} 페이지")
+            print(f"  [{p:>4}/{총_페이지 or '?'}] ", end="", flush=True)
+
+        if not 차량들:
             print("데이터 없음")
-            if p == 1:
-                print("\n  첫 페이지에서 데이터를 못 찾았습니다.")
-                print("  '페이지_소스.html'을 확인해주세요.")
+            if p > 1 and 총_페이지 is None:
+                목록_완료 = True
+            break
+
+        새것 = [차 for 차 in 차량들 if 차.get("차량번호") not in 본_번호]
+        if not 새것:
+            print("앞 페이지와 같은 목록 — 페이지 넘김이 안 됨, 중단")
+            break
+        for 차 in 새것:
+            본_번호.add(차.get("차량번호"))
+        전체.extend(새것)
+        print(f"{len(새것):>3}대 추출")
+
+        if 총_페이지 is None and len(차량들) < 50:
+            목록_완료 = True
+            break
+        p += 1
 
     return 전체
 
@@ -1146,6 +1215,51 @@ def _총_페이지_수(드라이버):
 # ════════════════════════════════════════════════════════════
 # 상세 사진 수집 (차량별 여러 장)
 # ════════════════════════════════════════════════════════════
+_기록부_구조_출력함 = False
+
+
+def _성능기록부_가져오기(주소, 상세주소=""):
+    """상세 페이지 iframe 이 불러오는 성능점검기록부(예: autocafe.co.kr/ASSO/CarCheck_Form.asp?OnCarNo=...)를 직접 열어 내용 해석.
+    로그인 없이 열리는 페이지라 requests 로 받는다."""
+    global _기록부_구조_출력함
+    try:
+        r = requests.get(주소, timeout=20, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
+            "Referer": 상세주소 or f"{사이트}/",
+        })
+        try:
+            html = r.content.decode("utf-8")
+        except UnicodeDecodeError:
+            html = r.content.decode("cp949", errors="replace")
+        soup = BeautifulSoup(html, "html.parser")
+        for t in soup(["script", "style"]):
+            t.decompose()
+        글 = " ".join(soup.get_text(" ").split())
+        없음 = ("내역이 없습니다" in 글) or len(글) < 40
+        표 = []
+        for tr in soup.select("tr"):
+            칸 = [" ".join(td.get_text(" ").split()) for td in tr.find_all(["th", "td"], recursive=False)]
+            칸 = [c for c in 칸 if c]
+            if 칸 and 칸 not in 표[-1:]:
+                표.append(칸)
+        체크 = []
+        for inp in soup.select("input[type=checkbox], input[type=radio]"):
+            if inp.has_attr("checked"):
+                체크.append({"name": inp.get("name", ""), "value": inp.get("value", "")})
+        이미지 = [urljoin(주소, img.get("src")) for img in soup.select("img[src]")][:60]
+        결과 = {"url": 주소, "status": r.status_code, "exists": not 없음,
+                "text": 글[:6000], "rows": 표[:250], "checked": 체크[:300], "images": 이미지}
+        if not 없음 and not _기록부_구조_출력함:
+            _기록부_구조_출력함 = True
+            print(f"\n  [기록부 구조] {주소} 상태={r.status_code} 글자={len(글)} 표줄={len(표)} 체크={len(체크)} 이미지={len(이미지)}")
+            print(f"  [기록부 구조] 표 앞부분: {json.dumps(표[:25], ensure_ascii=False)[:2500]}")
+            print(f"  [기록부 구조] 체크 예: {체크[:15]} | 이미지 예: {이미지[:5]}")
+            print(f"  [기록부 구조] 본문 앞부분: {글[:1500]}")
+        return 결과
+    except Exception as e:
+        return {"url": 주소, "error": str(e)[:200]}
+
+
 def 상세_사진_수집(드라이버, 차량_목록):
     """각 차량 상세 페이지에서 사진 여러 장 수집 (배치 단위)"""
 
@@ -1312,6 +1426,8 @@ def 상세_사진_수집(드라이버, 차량_목록):
                     done(out);
                 }).catch(function(e){ done({error: String(e)}); });
             """, 차.get("encarno", ""), i == 0) or {}
+            time.sleep(random.uniform(3, 6))  # 예전 화면 로딩 대기와 같은 간격 유지
+            alert_처리(드라이버)
 
             if 상세.get("error"):
                 raise Exception(상세["error"])
@@ -1329,6 +1445,13 @@ def 상세_사진_수집(드라이버, 차량_목록):
 
             사진들 = 상세.get("photos", []) or []
             성능 = 상세.get("perf", {}) or {}
+
+            # 성능점검기록부 본문: 상세 페이지 iframe 이 외부 기록부 페이지를 불러옴 → 그 주소를 직접 연다
+            기록부주소 = [u for u in (성능.get("frames") or [])
+                         if u and u.startswith("http") and re.search(r"CarCheck|Check_Form|[Pp]erform|[Ii]nspect", u)]
+            if 기록부주소:
+                time.sleep(random.uniform(1, 2))
+                성능["record"] = _성능기록부_가져오기(기록부주소[0], 링크)
 
             차["사진URL들"] = 사진들
             차["성능기록부"] = 성능
@@ -1525,10 +1648,13 @@ def 메인():
         # DB 저장 + 사라진 매물 처리 (로컬 + Supabase)
         신규 = 차량_저장(차량_목록)
         번호들 = [차["차량번호"] for 차 in 차량_목록 if 차.get("차량번호")]
-        사라진 = 사라진_매물_처리(번호들)
-
         Supabase_차량_저장(차량_목록)
-        Supabase_사라진_처리(번호들)
+        if 목록_완료:
+            사라진 = 사라진_매물_처리(번호들)
+            Supabase_사라진_처리(번호들)
+        else:
+            사라진 = 0
+            print("  목록을 끝까지 못 받아서 이번엔 「사라짐」 처리를 건너뜀")
 
         print(f"  신규 등록: {신규}대")
         if 사라진 > 0:
