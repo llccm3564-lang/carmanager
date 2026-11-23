@@ -245,6 +245,7 @@ def DB_초기화():
             연락처 TEXT,
             사진URL TEXT,
             사진URL들 TEXT,
+            성능기록부 TEXT,
             상세링크 TEXT,
             원본데이터 TEXT,
             최초발견 TEXT,
@@ -261,11 +262,12 @@ def DB_초기화():
             사라진_건수 INTEGER
         );
     """)
-    # 기존 DB에 사진URL들 컬럼이 없으면 추가
-    try:
-        db.execute("ALTER TABLE 차량 ADD COLUMN 사진URL들 TEXT")
-    except Exception:
-        pass
+    # 기존 DB에 없는 컬럼 추가
+    for col in ["사진URL들 TEXT", "성능기록부 TEXT"]:
+        try:
+            db.execute(f"ALTER TABLE 차량 ADD COLUMN {col}")
+        except Exception:
+            pass
     db.commit()
     db.close()
 
@@ -1114,35 +1116,102 @@ def 상세_사진_수집(드라이버, 차량_목록):
                 return photos;
             """) or []
 
-            차["사진URL들"] = 사진들
+            # 성능기록부 추출
+            성능 = 드라이버.execute_script("""
+                var result = {links: [], info: {}, perfSection: ''};
 
+                document.querySelectorAll('a, button').forEach(function(el) {
+                    var text = (el.innerText || '').trim();
+                    var href = el.href || el.getAttribute('onclick') || '';
+                    if (text.indexOf('성능') !== -1 || text.indexOf('점검') !== -1 ||
+                        text.indexOf('진단') !== -1 || text.indexOf('이력') !== -1 ||
+                        href.indexOf('erform') !== -1 || href.indexOf('nspect') !== -1) {
+                        result.links.push({text: text.substring(0,50), href: href.substring(0,200)});
+                    }
+                });
+
+                document.querySelectorAll('table').forEach(function(tbl) {
+                    tbl.querySelectorAll('tr').forEach(function(tr) {
+                        var cells = tr.querySelectorAll('th, td');
+                        for (var i = 0; i < cells.length - 1; i++) {
+                            var key = cells[i].innerText.trim().replace(/\\s+/g,' ');
+                            var val = cells[i+1].innerText.trim().replace(/\\s+/g,' ');
+                            if (key && val && key.length < 30 && val.length < 200) {
+                                result.info[key] = val;
+                            }
+                        }
+                    });
+                });
+
+                document.querySelectorAll('dt').forEach(function(dt) {
+                    var dd = dt.nextElementSibling;
+                    if (dd && dd.tagName === 'DD') {
+                        var key = dt.innerText.trim();
+                        var val = dd.innerText.trim();
+                        if (key && val && key.length < 30) result.info[key] = val.substring(0,200);
+                    }
+                });
+
+                var keywords = ['성능', '점검', '사고', '침수', '교환', '판금', '도색'];
+                document.querySelectorAll('div, section').forEach(function(el) {
+                    var t = el.innerText || '';
+                    if (t.length > 20 && t.length < 2000) {
+                        var hit = keywords.some(function(k){ return t.indexOf(k) !== -1; });
+                        if (hit && !result.perfSection) {
+                            result.perfSection = t.substring(0, 1500);
+                        }
+                    }
+                });
+
+                return result;
+            """) or {}
+
+            차["사진URL들"] = 사진들
+            차["성능기록부"] = 성능
+
+            부분출력 = []
             if 사진들:
+                부분출력.append(f"사진{len(사진들)}장")
+            if 성능.get("links"):
+                부분출력.append(f"성능링크{len(성능['links'])}")
+            if 성능.get("info"):
+                부분출력.append(f"상세{len(성능['info'])}항목")
+            if 성능.get("perfSection"):
+                부분출력.append("성능섹션O")
+
+            if 사진들 or 성능.get("info") or 성능.get("links"):
                 수집_성공 += 1
                 총_장수 += len(사진들)
-                print(f"사진 {len(사진들)}장")
+                print(" | ".join(부분출력) if 부분출력 else "데이터 없음")
 
-                # 즉시 DB에 저장 (다음 실행에서 건너뛰도록)
+                성능JSON = json.dumps(성능, ensure_ascii=False) if (성능.get("info") or 성능.get("links") or 성능.get("perfSection")) else None
+
                 db = DB_연결()
+                사진JSON = json.dumps(사진들, ensure_ascii=False) if 사진들 else None
                 db.execute(
-                    "UPDATE 차량 SET 사진URL들=? WHERE 차량번호=?",
-                    (json.dumps(사진들, ensure_ascii=False), 번호)
+                    "UPDATE 차량 SET 사진URL들=COALESCE(?,사진URL들), 성능기록부=COALESCE(?,성능기록부) WHERE 차량번호=?",
+                    (사진JSON, 성능JSON, 번호)
                 )
                 db.commit()
                 db.close()
 
-                # Supabase에도 즉시 저장
                 if supabase_client:
                     try:
-                        supabase_client.table("car_listings").update({
-                            "photo_urls": json.dumps(사진들, ensure_ascii=False)
-                        }).eq("car_id", 번호).execute()
+                        업데이트 = {}
+                        if 사진들:
+                            업데이트["photo_urls"] = json.dumps(사진들, ensure_ascii=False)
+                        if 성능JSON:
+                            업데이트["performance_record"] = 성능JSON
+                        if 업데이트:
+                            supabase_client.table("car_listings").update(업데이트).eq("car_id", 번호).execute()
                     except Exception:
                         pass
             else:
-                print("사진 없음")
+                print("데이터 없음")
 
         except Exception as e:
             차["사진URL들"] = []
+            차["성능기록부"] = {}
             print(f"실패 ({str(e)[:50]})")
 
     print(f"\n  상세 사진 완료: {수집_성공}대에서 총 {총_장수}장 수집")
@@ -1219,7 +1288,7 @@ def 보고서_생성():
     컬럼 = [
         "차량번호", "차종", "가격", "연식", "주행거리", "연료", "변속기",
         "색상", "사고여부", "번호판", "지역", "판매자", "연락처",
-        "상태", "최초발견", "최근확인", "사라진날", "상세링크",
+        "상태", "최초발견", "최근확인", "사라진날", "성능기록부", "상세링크",
     ]
 
     with open(보고서_파일, "w", newline="", encoding="utf-8-sig") as f:
