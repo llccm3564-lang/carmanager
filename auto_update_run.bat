@@ -1,5 +1,5 @@
 @echo off
-title CarManager Auto Loop
+title BussanCar Auto Loop
 
 :LOOP
 set "DIR=%~dp0"
@@ -24,7 +24,7 @@ xcopy "%TEMP_DIR%\carmanager-master\*" "%DIR%" /s /y /q >nul 2>&1
 
 echo [4/4] Installing packages and running...
 py -m pip install -r "%DIR%requirements.txt" -q 2>nul
-py "%DIR%carmanager.py" --headless
+py "%DIR%bussancar.py"
 
 echo.
 echo Run complete. Next run in 5 minutes...

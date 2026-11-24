@@ -1,0 +1,632 @@
+"""
+부싼카 매물 수집 프로그램
+
+부싼카(bussancar.com) API로 중고차 매물 정보를 수집한다.
+카매니저 Selenium 파싱을 대체하는 경량 버전.
+
+기능:
+  1. 부싼카 API로 전체 매물 목록 수집
+  2. 로컬 SQLite + Supabase 동시 저장
+  3. 사라진 매물 자동 감지
+  4. CSV 보고서 생성
+  5. 프록시 지원 (일반/주거용)
+
+사용법:
+  py bussancar.py              (전체 수집)
+  py bussancar.py --test       (100대만 테스트)
+  py bussancar.py --proxy      (.env의 PROXY_URL 사용)
+"""
+
+import sqlite3
+import os
+import sys
+import time
+import csv
+import json
+import random
+from datetime import datetime
+
+import requests
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
+
+# ── 로그 자동 저장 (화면 + log.txt 동시 출력) ──
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_log_path = os.path.join(_script_dir, "log_bussancar.txt")
+
+
+class _Tee:
+    def __init__(self, *streams):
+        self._streams = streams
+    def write(self, text):
+        for s in self._streams:
+            try:
+                s.write(text)
+                s.flush()
+            except Exception:
+                pass
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+
+_로그_시작위치 = 0
+try:
+    if os.path.exists(_log_path) and os.path.getsize(_log_path) > 5_000_000:
+        os.replace(_log_path, _log_path + ".old")
+    _로그_시작위치 = os.path.getsize(_log_path) if os.path.exists(_log_path) else 0
+except Exception:
+    pass
+
+try:
+    _log_file = open(_log_path, "a", encoding="utf-8")
+    sys.stdout = _Tee(sys.__stdout__, _log_file)
+    sys.stderr = _Tee(sys.__stderr__, _log_file)
+except Exception:
+    pass
+
+# ── Supabase 로그 올리기 (1분마다 실시간) ──
+import atexit
+import threading
+
+_로그_실행ID = datetime.now().strftime("%m%d-%H%M%S")
+_로그_PC = os.environ.get("COMPUTERNAME", "unknown")
+_로그_위치 = _로그_시작위치
+_로그_순번 = 0
+_로그_마지막전송 = time.time()
+_로그_잠금 = threading.Lock()
+_로그_끝냄 = False
+
+
+def _로그_행_추가(내용, 끝=False):
+    global _로그_순번
+    url = os.environ.get("SUPABASE_URL", "")
+    key = os.environ.get("SUPABASE_KEY", "")
+    if not url or not key:
+        return False
+    표시 = f"{_로그_PC}|BSC-{_로그_실행ID}|{_로그_순번:03d}" + ("|끝" if 끝 else "")
+    try:
+        r = requests.post(
+            f"{url}/rest/v1/error_logs",
+            headers={"apikey": key, "Authorization": f"Bearer {key}",
+                     "Content-Type": "application/json", "Prefer": "return=minimal"},
+            json={"content": 내용, "pc_name": 표시},
+            timeout=15,
+        )
+        if r.status_code in (200, 201, 204):
+            _로그_순번 += 1
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _로그_보내기(끝=False):
+    global _로그_위치, _로그_마지막전송, _로그_끝냄
+    if not _로그_잠금.acquire(timeout=20):
+        return
+    try:
+        if _로그_끝냄:
+            return
+        try:
+            _log_file.flush()
+        except Exception:
+            pass
+        try:
+            with open(_log_path, "rb") as f:
+                f.seek(_로그_위치)
+                새것 = f.read()
+        except Exception:
+            새것 = b""
+        if not 끝:
+            k = 새것.rfind(b"\n")
+            새것 = 새것[:k + 1] if k >= 0 else b""
+        if 새것:
+            pos = 0
+            while pos < len(새것):
+                끝위치 = min(pos + 100000, len(새것))
+                if 끝위치 < len(새것):
+                    k = 새것.rfind(b"\n", pos, 끝위치)
+                    if k > pos:
+                        끝위치 = k + 1
+                조각 = 새것[pos:끝위치]
+                마지막 = 끝 and 끝위치 >= len(새것)
+                if not _로그_행_추가(조각.decode("utf-8", errors="replace"), 끝=마지막):
+                    return
+                _로그_위치 += len(조각)
+                pos = 끝위치
+            _로그_마지막전송 = time.time()
+        elif 끝:
+            _로그_행_추가("(실행 끝)", 끝=True)
+        elif time.time() - _로그_마지막전송 > 300:
+            if _로그_행_추가(f"  (진행 중 — {datetime.now().strftime('%H:%M:%S')})"):
+                _로그_마지막전송 = time.time()
+        if 끝:
+            _로그_끝냄 = True
+    finally:
+        _로그_잠금.release()
+
+
+def _로그_주기적_보내기():
+    time.sleep(10)
+    while not _로그_끝냄:
+        _로그_보내기()
+        time.sleep(60)
+
+
+threading.Thread(target=_로그_주기적_보내기, daemon=True).start()
+atexit.register(lambda: _로그_보내기(끝=True))
+
+try:
+    from supabase import create_client
+except ImportError:
+    create_client = None
+
+
+# ════════════════════════════════════════════════════════════
+# 설정
+# ════════════════════════════════════════════════════════════
+API_URL = "https://bussancar.com/proxy/api/v1/vehicle/list"
+DB_파일 = "매물_데이터.db"
+보고서_파일 = "매물_보고서.csv"
+페이지_크기 = 100
+대기_범위 = (2, 5)
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+PROXY_URL = os.environ.get("PROXY_URL", "")
+
+테스트모드 = "--test" in sys.argv
+프록시_사용 = "--proxy" in sys.argv or bool(PROXY_URL)
+supabase_client = None
+
+
+# ════════════════════════════════════════════════════════════
+# Supabase
+# ════════════════════════════════════════════════════════════
+def Supabase_초기화():
+    global supabase_client
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        print("  Supabase 미설정 -> 로컬 DB만 사용")
+        return False
+    if not create_client:
+        print("  supabase 패키지 없음 -> 로컬 DB만 사용")
+        return False
+    try:
+        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        supabase_client.table("car_listings").select("count", count="exact").limit(0).execute()
+        print("  Supabase 연결 성공!")
+        return True
+    except Exception as e:
+        print(f"  Supabase 연결 실패: {e}")
+        supabase_client = None
+        return False
+
+
+def Supabase_차량_저장(차량_목록):
+    if not supabase_client:
+        return
+    지금 = datetime.now().isoformat()
+    테이블 = supabase_client.table("car_listings")
+    성공 = 0
+    실패 = 0
+
+    for 차 in 차량_목록:
+        번호 = 차.get("차량번호", "")
+        if not 번호:
+            continue
+
+        row = {
+            "car_id": 번호,
+            "model": 차.get("차종", ""),
+            "price": 차.get("가격", ""),
+            "year": 차.get("연식", ""),
+            "mileage": 차.get("주행거리", ""),
+            "fuel": 차.get("연료", ""),
+            "transmission": 차.get("변속기", ""),
+            "color": 차.get("색상", ""),
+            "accident": 차.get("사고여부", ""),
+            "plate": 차.get("번호판", ""),
+            "region": 차.get("지역", ""),
+            "seller": 차.get("판매자", ""),
+            "phone": 차.get("연락처", ""),
+            "photo_url": 차.get("사진URL", ""),
+            "detail_url": 차.get("상세링크", ""),
+            "status": "active",
+            "last_seen": 지금,
+            "removed_at": None,
+        }
+
+        try:
+            기존 = 테이블.select("car_id").eq("car_id", 번호).execute()
+            if 기존.data:
+                테이블.update(row).eq("car_id", 번호).execute()
+            else:
+                row["first_seen"] = 지금
+                테이블.insert(row).execute()
+            성공 += 1
+        except Exception:
+            실패 += 1
+
+    print(f"  Supabase: {성공}대 저장" + (f" (실패 {실패}대)" if 실패 else ""))
+
+
+def Supabase_사라진_처리(현재_차량번호들):
+    if not supabase_client:
+        return 0
+    지금 = datetime.now().isoformat()
+    테이블 = supabase_client.table("car_listings")
+    현재 = set(str(x) for x in 현재_차량번호들)
+    사라진 = 0
+
+    try:
+        오프셋 = 0
+        while True:
+            결과 = 테이블.select("car_id").eq("status", "active").range(오프셋, 오프셋 + 999).execute()
+            if not 결과.data:
+                break
+            for row in 결과.data:
+                if row["car_id"] not in 현재:
+                    try:
+                        테이블.update({"status": "removed", "removed_at": 지금}).eq("car_id", row["car_id"]).execute()
+                        사라진 += 1
+                    except Exception:
+                        pass
+            if len(결과.data) < 1000:
+                break
+            오프셋 += 1000
+    except Exception as e:
+        print(f"  Supabase 사라짐 처리 실패: {str(e)[:80]}")
+
+    return 사라진
+
+
+# ════════════════════════════════════════════════════════════
+# 로컬 DB
+# ════════════════════════════════════════════════════════════
+def DB_연결():
+    db_path = os.path.join(_script_dir, DB_파일)
+    db = sqlite3.connect(db_path)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def DB_초기화():
+    db = DB_연결()
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS 차량 (
+            차량번호 TEXT PRIMARY KEY,
+            차종 TEXT,
+            가격 TEXT,
+            연식 TEXT,
+            주행거리 TEXT,
+            연료 TEXT,
+            변속기 TEXT,
+            색상 TEXT,
+            사고여부 TEXT,
+            번호판 TEXT,
+            지역 TEXT,
+            판매자 TEXT,
+            연락처 TEXT,
+            사진URL TEXT,
+            사진URL들 TEXT,
+            성능기록부 TEXT,
+            상세링크 TEXT,
+            원본데이터 TEXT,
+            최초발견 TEXT,
+            최근확인 TEXT,
+            상태 TEXT DEFAULT '등록중',
+            사라진날 TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS 수집기록 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            시각 TEXT,
+            수집_건수 INTEGER,
+            신규_건수 INTEGER,
+            사라진_건수 INTEGER
+        );
+    """)
+    db.commit()
+    db.close()
+
+
+def 차량_저장(차량_목록):
+    db = DB_연결()
+    지금 = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    신규 = 0
+
+    for 차 in 차량_목록:
+        번호 = 차.get("차량번호", "")
+        if not 번호:
+            continue
+
+        기존 = db.execute("SELECT 1 FROM 차량 WHERE 차량번호=?", (번호,)).fetchone()
+        원본 = json.dumps(차, ensure_ascii=False)
+
+        if 기존:
+            db.execute("""
+                UPDATE 차량
+                SET 최근확인=?, 상태='등록중', 사라진날=NULL,
+                    차종=?, 가격=?, 연식=?, 주행거리=?, 연료=?, 변속기=?,
+                    색상=?, 사고여부=?, 번호판=?, 지역=?, 판매자=?, 연락처=?,
+                    사진URL=?, 상세링크=?, 원본데이터=?
+                WHERE 차량번호=?
+            """, (
+                지금,
+                차.get("차종", ""), 차.get("가격", ""), 차.get("연식", ""),
+                차.get("주행거리", ""), 차.get("연료", ""), 차.get("변속기", ""),
+                차.get("색상", ""), 차.get("사고여부", ""), 차.get("번호판", ""),
+                차.get("지역", ""), 차.get("판매자", ""), 차.get("연락처", ""),
+                차.get("사진URL", ""), 차.get("상세링크", ""), 원본,
+                번호
+            ))
+        else:
+            db.execute("""
+                INSERT INTO 차량
+                (차량번호,차종,가격,연식,주행거리,연료,변속기,색상,사고여부,
+                 번호판,지역,판매자,연락처,사진URL,상세링크,원본데이터,
+                 최초발견,최근확인,상태)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'등록중')
+            """, (
+                번호,
+                차.get("차종", ""), 차.get("가격", ""), 차.get("연식", ""),
+                차.get("주행거리", ""), 차.get("연료", ""), 차.get("변속기", ""),
+                차.get("색상", ""), 차.get("사고여부", ""), 차.get("번호판", ""),
+                차.get("지역", ""), 차.get("판매자", ""), 차.get("연락처", ""),
+                차.get("사진URL", ""), 차.get("상세링크", ""), 원본,
+                지금, 지금
+            ))
+            신규 += 1
+
+    db.commit()
+    db.close()
+    return 신규
+
+
+def 사라진_매물_처리(현재_차량번호들):
+    db = DB_연결()
+    지금 = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    현재 = set(str(x) for x in 현재_차량번호들)
+
+    등록중 = db.execute(
+        "SELECT 차량번호 FROM 차량 WHERE 상태='등록중'"
+    ).fetchall()
+
+    사라진 = 0
+    for row in 등록중:
+        if row["차량번호"] not in 현재:
+            db.execute(
+                "UPDATE 차량 SET 상태='사라짐', 사라진날=? WHERE 차량번호=?",
+                (지금, row["차량번호"])
+            )
+            사라진 += 1
+
+    db.commit()
+    db.close()
+    return 사라진
+
+
+# ════════════════════════════════════════════════════════════
+# API 호출
+# ════════════════════════════════════════════════════════════
+def _세션_만들기():
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Referer": "https://bussancar.com/buy-car",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+    })
+    if 프록시_사용 and PROXY_URL:
+        s.proxies = {"http": PROXY_URL, "https": PROXY_URL}
+        print(f"  프록시: {PROXY_URL[:40]}...")
+    return s
+
+
+def API_매물_가져오기(세션, 페이지, 크기=100):
+    try:
+        r = 세션.get(API_URL, params={"page": 페이지, "size": 크기}, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("success"):
+            print(f"  API 오류: {data.get('message', '?')}")
+            return None, 0
+        return data["data"]["contents"], data["data"]["total"]
+    except requests.exceptions.RequestException as e:
+        print(f"  API 요청 실패: {str(e)[:100]}")
+        return None, 0
+    except (KeyError, json.JSONDecodeError) as e:
+        print(f"  API 응답 파싱 실패: {str(e)[:100]}")
+        return None, 0
+
+
+def API_차량_변환(item):
+    v = item.get("vehicleInventory", {})
+
+    부품 = [v.get("carMakerName", ""), v.get("carModelName", ""), v.get("carGradeName", "")]
+    차종 = " ".join(x for x in 부품 if x).strip()
+
+    가격원 = v.get("carAmountSale", "")
+    try:
+        가격 = f"{int(가격원):,}만원" if 가격원 else ""
+    except (ValueError, TypeError):
+        가격 = f"{가격원}만원" if 가격원 else ""
+
+    km원 = v.get("carUseKm", "")
+    try:
+        주행거리 = f"{int(km원):,}km" if km원 else ""
+    except (ValueError, TypeError):
+        주행거리 = f"{km원}km" if km원 else ""
+
+    지역 = f"{v.get('sido', '')} {v.get('city', '')}".strip()
+
+    return {
+        "차량번호": str(v.get("carNo", "")),
+        "차종": 차종,
+        "가격": 가격,
+        "연식": v.get("carRegYear", ""),
+        "주행거리": 주행거리,
+        "연료": v.get("carFuel", ""),
+        "변속기": v.get("carMission", ""),
+        "색상": v.get("carColor", ""),
+        "사고여부": "",
+        "번호판": v.get("carPlateNumber", ""),
+        "지역": 지역,
+        "판매자": v.get("shopName", ""),
+        "연락처": "",
+        "사진URL": v.get("thumbnail", ""),
+        "상세링크": f"https://bussancar.com/buy-car/{v.get('carNo', '')}",
+    }
+
+
+# ════════════════════════════════════════════════════════════
+# 보고서
+# ════════════════════════════════════════════════════════════
+def 보고서_생성():
+    db = DB_연결()
+    rows = db.execute(
+        "SELECT * FROM 차량 WHERE 상태='등록중' ORDER BY 최근확인 DESC"
+    ).fetchall()
+    db.close()
+
+    if not rows:
+        print("  보고서: 등록중인 차량 없음")
+        return
+
+    경로 = os.path.join(_script_dir, 보고서_파일)
+    with open(경로, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["차량번호", "차종", "가격", "연식", "주행거리", "연료", "변속기",
+                     "색상", "번호판", "지역", "판매자", "사진URL", "상세링크",
+                     "최초발견", "최근확인"])
+        for r in rows:
+            w.writerow([
+                r["차량번호"], r["차종"], r["가격"], r["연식"], r["주행거리"],
+                r["연료"], r["변속기"], r["색상"], r["번호판"], r["지역"],
+                r["판매자"], r["사진URL"], r["상세링크"], r["최초발견"], r["최근확인"]
+            ])
+
+    print(f"  보고서: {len(rows)}대 -> {보고서_파일}")
+
+
+# ════════════════════════════════════════════════════════════
+# 메인
+# ════════════════════════════════════════════════════════════
+def 메인():
+    DB_초기화()
+
+    print()
+    print(f"  ===== 부싼카 매물 수집 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} =====")
+    print("  ┌────────────────────────────────────┐")
+    print("  │      부싼카 API 매물 수집 프로그램    │")
+    print("  ├────────────────────────────────────┤")
+    if 테스트모드:
+        print("  │  [테스트] 100대만 수집              │")
+    else:
+        print("  │  전체 매물 수집                     │")
+    프록시표시 = "켜짐" if 프록시_사용 and PROXY_URL else "꺼짐"
+    print(f"  │  프록시: {프록시표시}                          │")
+    print("  └────────────────────────────────────┘")
+    print()
+
+    Supabase_초기화()
+
+    세션 = _세션_만들기()
+
+    print("  매물 목록 가져오는 중...")
+    items, 전체 = API_매물_가져오기(세션, 1, 페이지_크기)
+    if items is None:
+        print("  첫 페이지 가져오기 실패. 종료.")
+        return
+
+    print(f"  전체 매물: {전체:,}대")
+
+    최대 = 100 if 테스트모드 else 전체
+    전체_차량 = []
+
+    for item in items:
+        차 = API_차량_변환(item)
+        if 차["차량번호"]:
+            전체_차량.append(차)
+        if len(전체_차량) >= 최대:
+            break
+
+    총페이지 = (min(최대, 전체) + 페이지_크기 - 1) // 페이지_크기
+    print(f"  수집 목표: {min(최대, 전체):,}대 ({총페이지}페이지)")
+    print(f"  1페이지: {len(전체_차량)}대 수집")
+
+    for p in range(2, 총페이지 + 1):
+        if len(전체_차량) >= 최대:
+            break
+
+        대기 = random.uniform(*대기_범위)
+        time.sleep(대기)
+
+        items, _ = API_매물_가져오기(세션, p, 페이지_크기)
+        if items is None:
+            print(f"  {p}페이지 실패 — 중단")
+            break
+
+        for item in items:
+            차 = API_차량_변환(item)
+            if 차["차량번호"]:
+                전체_차량.append(차)
+            if len(전체_차량) >= 최대:
+                break
+
+        print(f"  {p}/{총페이지}페이지: 누적 {len(전체_차량)}대 (대기 {대기:.1f}초)")
+
+    if not 전체_차량:
+        print("  수집된 차량 없음. 종료.")
+        return
+
+    print(f"\n  DB 저장 중... ({len(전체_차량)}대)")
+    신규 = 차량_저장(전체_차량)
+    print(f"  로컬 DB: {len(전체_차량)}대 저장 (신규 {신규}대)")
+
+    if supabase_client:
+        print("  Supabase 저장 중...")
+        Supabase_차량_저장(전체_차량)
+
+    if not 테스트모드:
+        현재번호들 = [차["차량번호"] for 차 in 전체_차량]
+        사라진 = 사라진_매물_처리(현재번호들)
+        sb사라진 = Supabase_사라진_처리(현재번호들)
+        print(f"  사라진 매물: 로컬 {사라진}대" + (f" / Supabase {sb사라진}대" if supabase_client else ""))
+
+    db = DB_연결()
+    db.execute(
+        "INSERT INTO 수집기록 (시각,수집_건수,신규_건수,사라진_건수) VALUES (?,?,?,?)",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), len(전체_차량), 신규, 0)
+    )
+    db.commit()
+    db.close()
+
+    보고서_생성()
+
+    db = DB_연결()
+    총등록 = db.execute("SELECT COUNT(*) FROM 차량 WHERE 상태='등록중'").fetchone()[0]
+    총사라짐 = db.execute("SELECT COUNT(*) FROM 차량 WHERE 상태='사라짐'").fetchone()[0]
+    db.close()
+
+    print(f"\n  ===== 완료 =====")
+    print(f"  이번 수집: {len(전체_차량)}대 (신규 {신규}대)")
+    print(f"  DB 현황: 등록중 {총등록:,}대 / 사라짐 {총사라짐:,}대")
+
+    if 전체_차량:
+        예시 = 전체_차량[0]
+        print(f"\n  [예시] {예시['차종']} | {예시['가격']} | {예시['연식']}년 | "
+              f"{예시['주행거리']} | {예시['번호판']} | {예시['지역']}")
+
+
+if __name__ == "__main__":
+    메인()
