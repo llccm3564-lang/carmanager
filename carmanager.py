@@ -695,6 +695,15 @@ def 로그인(드라이버, 아이디, 비밀번호):
 
     if "/User/Login" in 드라이버.current_url:
         print("  로그인 실패 — 아이디/비밀번호를 확인하세요.")
+        # 틀린 비밀번호로 계속 시도하면 계정이 잠길 수 있어서 멈춤 (11-24 비밀번호 바뀐 뒤 반복 시도 방지)
+        try:
+            with open(중지_파일, "w", encoding="utf-8") as f:
+                f.write(f"{_지금글()} 로그인 실패 ({msg or '알림 없음'})\n"
+                        ".env 의 CM_ID / CM_PW 를 확인해서 고친 뒤 이 파일을 지우면 다시 돌아갑니다.\n")
+            print(f"  → 더 시도하지 않게 {중지_파일} 를 만들었어요. 계정 정보를 고친 뒤 이 파일을 지우세요.")
+        except Exception:
+            pass
+        _소리("문제")
         return False
 
     print("  로그인 성공!")
@@ -1395,7 +1404,11 @@ def 지역_사라짐_처리(키, 바퀴시작):
 def _실행_해도_되나():
     """(돌려도 되는지, 이유). 브라우저 열기 전에 판단 → 할 일 없으면 로그인도 안 함."""
     if os.path.exists(중지_파일):
-        return False, f"중지.txt 있음 — 이용제한을 푼 뒤 {중지_파일} 를 지우면 다시 돌아요"
+        try:
+            이유 = open(중지_파일, encoding="utf-8").readline().strip()
+        except Exception:
+            이유 = ""
+        return False, f"중지.txt 있음 ({이유}) — 원인을 해결한 뒤 {중지_파일} 를 지우면 다시 돌아요"
     if HEADLESS and "--now" not in sys.argv:  # 자동 실행일 때만 시간 규칙 (손으로 켠 실행·--now 는 바로 돎)
         시 = datetime.now().hour
         if 쉬는_시간[0] <= 시 < 쉬는_시간[1]:
