@@ -23,6 +23,7 @@ import json
 import re
 import getpass
 import random
+import gzip
 from datetime import datetime, timedelta
 from urllib.parse import urljoin, quote, unquote
 
@@ -230,6 +231,9 @@ except ImportError:
 사이트 = "https://www.carmanager.co.kr"
 DB_파일 = "매물_데이터.db"
 사진_폴더 = "사진"
+# 원문 저장: 나중에 뽑을 항목이 바뀌어도 카매니저에 다시 접속하지 않고 여기서 다시 뽑음 (11-24)
+상세원문_폴더 = "상세원문"      # 카매니저 상세 페이지 원문 (차마다 .html.gz)
+기록부원문_폴더 = "기록부원문"  # 성능기록부 페이지 원문 (그려진 뒤 화면, 차마다 .html.gz)
 보고서_파일 = "매물_보고서.csv"
 최대_페이지 = 0  # 0 = 제한 없음 (실제 한도는 아래 한번_목록_페이지·하루_목록_페이지)
 상세_사진_배치 = 20  # (예전 이름) 한 번에 상세 받을 차량 수 = 한번_상세_대수
@@ -240,9 +244,9 @@ DB_파일 = "매물_데이터.db"
 # ── 속도·양 (11-23 gkvlfrl 이용제한 뒤 정함: 목록 59페이지/25분 만에 막힘) ──
 목록_수집_켜짐 = False     # 11-23 오찬: 목록은 일단 빼 둠 (이미 받은 차 상세부터). 다시 켤 땐 True
 한번_목록_페이지 = 7       # 실행 한 번에 목록 최대 7페이지 (350대)
-한번_상세_대수 = 20        # 실행 한 번에 상세 최대 20대
+한번_상세_대수 = 100       # 실행 한 번에 상세 최대 100대 (11-24 오찬: 11-23 시험 실행과 같은 속도)
 하루_목록_페이지 = 20      # 하루 목록 최대 20페이지 (1,000대)
-하루_상세_대수 = 200       # 하루 상세 최대 200대
+하루_상세_대수 = 0         # 하루 상세 상한. 0 = 제한 없음 (11-24 오찬: 200대 제한 없앰)
 목록_바퀴_간격_시간 = 48   # 한 지역 목록을 끝까지 다 훑으면 이틀 뒤에 다시
 대기_범위 = (20, 40)       # 목록 페이지 사이·상세 차 사이 랜덤 대기(초)
 실행_간격_분 = (30, 60)    # 실행 끝나고 다음 실행까지 랜덤(분). bat 은 5분마다 켜지만 이 시간 전엔 바로 쉬고 끝남
@@ -252,7 +256,8 @@ for _a in sys.argv:
     if _a.startswith("--detail="):
         try:
             한번_상세_대수 = max(1, int(_a.split("=", 1)[1]))
-            하루_상세_대수 = max(하루_상세_대수, 한번_상세_대수)
+            if 하루_상세_대수 > 0:
+                하루_상세_대수 = max(하루_상세_대수, 한번_상세_대수)
         except ValueError:
             pass
 제한_문구 = ("사용이 제한", "이용제한", "보안 정책에 위배")
@@ -1359,7 +1364,7 @@ def _실행_해도_되나():
     """(돌려도 되는지, 이유). 브라우저 열기 전에 판단 → 할 일 없으면 로그인도 안 함."""
     if os.path.exists(중지_파일):
         return False, f"중지.txt 있음 — 이용제한을 푼 뒤 {중지_파일} 를 지우면 다시 돌아요"
-    if HEADLESS:  # 자동 실행일 때만 시간 규칙 (손으로 켠 실행은 바로 돎)
+    if HEADLESS and "--now" not in sys.argv:  # 자동 실행일 때만 시간 규칙 (손으로 켠 실행·--now 는 바로 돎)
         시 = datetime.now().hour
         if 쉬는_시간[0] <= 시 < 쉬는_시간[1]:
             return False, f"밤 쉬는 시간 ({쉬는_시간[0]}~{쉬는_시간[1]}시)"
@@ -1371,11 +1376,11 @@ def _실행_해도_되나():
             except Exception:
                 pass
     사용 = 하루사용_읽기()
-    상세_가능 = 사용["상세"] < 하루_상세_대수 and bool(DB_상세_대상(1))
+    상세_가능 = (하루_상세_대수 <= 0 or 사용["상세"] < 하루_상세_대수) and bool(DB_상세_대상(1))
     목록_가능 = 목록_수집_켜짐 and 사용["목록페이지"] < 하루_목록_페이지 and 목록_할_차례()[0]
     if not 상세_가능 and not 목록_가능:
         목록이유 = 목록_할_차례()[1] if 목록_수집_켜짐 else "꺼 둠"
-        return False, (f"오늘 할 일 없음 (상세 {사용['상세']}/{하루_상세_대수}대, "
+        return False, (f"할 일 없음 (상세 {사용['상세']}/{하루_상세_대수 or '제한없음'}대, "
                        f"목록 {사용['목록페이지']}/{하루_목록_페이지}페이지, 목록: {목록이유})")
     return True, ""
 
@@ -1806,6 +1811,30 @@ def 사진주소_원본으로_고치기():
     return len(고친)
 
 
+def _원문_이름(번호):
+    return re.sub(r'[\\/:*?"<>|]', "_", 번호 or "unknown") + ".html.gz"
+
+
+def _원문_저장(폴더, 번호, html):
+    """페이지 원문을 압축해서 저장 (차 한 대 약 15KB). 같은 차를 다시 받으면 새것으로 덮음."""
+    if not html:
+        return
+    try:
+        os.makedirs(폴더, exist_ok=True)
+        with gzip.open(os.path.join(폴더, _원문_이름(번호)), "wt", encoding="utf-8") as f:
+            f.write(html)
+    except Exception as e:
+        print(f"(원문 저장 실패: {str(e)[:60]}) ", end="")
+
+
+def 원문_읽기(폴더, 번호):
+    try:
+        with gzip.open(os.path.join(폴더, _원문_이름(번호)), "rt", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
 def _기록부_출처(성능):
     """상세 페이지 정보로 성능기록부가 어디 있는지 정함 (sCarDetail.js 의 성능점검 탭과 같은 순서).
     1) carcheckoutUrl(별도 점검업체 주소) 2) NewGubun=A → autocafe 2020 양식(ChkSeq)
@@ -1830,7 +1859,7 @@ def _기록부_출처(성능):
 _기록부_구조_출력한_종류 = set()
 
 
-def _기록부_그리기(드라이버, 기록):
+def _기록부_그리기(드라이버, 기록, 번호=None):
     """성능기록부 페이지를 브라우저로 열어 내용 읽기 (autocafe·엠파크·별도 업체 모두).
     브라우저는 autocafe 인증서 문제도 알아서 처리하고, 화면에서 그려지는 엠파크 페이지도 읽힘.
     체크된 칸은 ■, 안 된 칸은 □ 로 글에 표시 (예: 「7.변속기 종류 ■자동 □수동」). 카매니저 접속 없음."""
@@ -1847,6 +1876,8 @@ def _기록부_그리기(드라이버, 기록):
             if "내역이 없습니다" in 글 or len(글) > 300:
                 break
         time.sleep(1)
+        if 번호:
+            _원문_저장(기록부원문_폴더, 번호, 드라이버.page_source)  # ■/□ 표시 넣기 전, 그려진 화면 그대로
         r = 드라이버.execute_script("""
             var checked = [];
             document.querySelectorAll('input[type=checkbox],input[type=radio]').forEach(function(x){
@@ -1917,7 +1948,7 @@ def 기록부_채우기(드라이버, 최대=200):
     for k, (번호, p, 기록) in enumerate(대상):
         if k > 0:
             time.sleep(random.uniform(2, 4))
-        기록 = _기록부_그리기(드라이버, 기록)
+        기록 = _기록부_그리기(드라이버, 기록, 번호)
         if 기록.get("render_error"):
             표시 = "실패 " + 기록["render_error"][:80]
         elif 기록.get("kind") == "카매니저자체":
@@ -2120,7 +2151,7 @@ def 상세_사진_수집(드라이버, 차량_목록, 최대=None):
                     });
                     perf.perfSection = best.substring(0, 2000);
 
-                    var out = {status: res.status, len: res.html.length, photos: photos, perf: perf};
+                    var out = {status: res.status, len: res.html.length, photos: photos, perf: perf, html: res.html};
                     // 이용제한 확인용: 짧은 응답은 본문을, 긴 응답은 제한 문구가 있을 때 그 앞뒤만
                     var bodyText = (doc.body ? doc.body.textContent : res.html).replace(/\\s+/g, ' ').trim();
                     var pk = res.html.indexOf('보안 정책에 위배');
@@ -2149,6 +2180,7 @@ def 상세_사진_수집(드라이버, 차량_목록, 최대=None):
             if msg:
                 _제한_확인(msg, f"상세 {i+1}번째 알림")
             _제한_확인(상세.get("head") or "", f"상세 {i+1}번째 ({차종})")
+            _원문_저장(상세원문_폴더, 번호, 상세.pop("html", None))
 
             if 상세.get("error"):
                 raise Exception(상세["error"])
@@ -2357,7 +2389,7 @@ def 메인():
     print("  │  - 이용제한 화면 보이면 바로 멈춤    │")
     print("  └────────────────────────────────────┘")
     사용 = 하루사용_읽기()
-    print(f"  오늘 쓴 양: 상세 {사용['상세']}/{하루_상세_대수}대 · 목록 {사용['목록페이지']}/{하루_목록_페이지}페이지 · "
+    print(f"  오늘 쓴 양: 상세 {사용['상세']}/{하루_상세_대수 or '제한없음'}대 · 목록 {사용['목록페이지']}/{하루_목록_페이지}페이지 · "
           f"로그인 {사용['로그인']}번")
     print(f"  이번 한도: 상세 {한번_상세_대수}대 · 목록 {한번_목록_페이지}페이지 · 대기 {대기_범위[0]}~{대기_범위[1]}초")
     print()
@@ -2395,7 +2427,7 @@ def 메인():
 
         # 1) 상세 먼저 — DB 에 있는 등록중 차 중 아직 안 받은 차
         사용 = 하루사용_읽기()
-        남은상세 = min(한번_상세_대수, 하루_상세_대수 - 사용["상세"])
+        남은상세 = 한번_상세_대수 if 하루_상세_대수 <= 0 else min(한번_상세_대수, 하루_상세_대수 - 사용["상세"])
         if 남은상세 > 0:
             상세대상 = DB_상세_대상(남은상세)
             if 상세대상:

@@ -10,3 +10,6 @@ log.txt
 중지.txt
 실행상태.json
 log.txt.old
+상세원문/
+기록부원문/
+파싱현황_*.csv
