@@ -2370,6 +2370,113 @@ def 상세_사진_수집(드라이버, 차량_목록, 최대=None, 끼워넣기=
 # ════════════════════════════════════════════════════════════
 # 사진 다운로드
 # ════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
+# Supabase 보관함(Storage)에 사진·원문 올리기 — 보관함_만들기.sql 실행 필요
+#   carmanager (비공개) / photos/<고유번호>/<파일> · raw/detail/<고유번호>.html.gz · raw/record/<고유번호>.html.gz
+#   공개용 키는 「올리기」만 가능(덮어쓰기 불가) → 이미 있으면 건너뜀
+# ════════════════════════════════════════════════════════════
+보관함 = "carmanager"
+_보관함_꺼짐 = False  # 보관함·권한이 없어서 실패가 이어지면 이번 실행에선 그만 올림
+
+
+def _보관함_한개(로컬, 경로, 형식):
+    url = f"{SUPABASE_URL}/storage/v1/object/{보관함}/{quote(경로, safe='/')}"
+    try:
+        with open(로컬, "rb") as f:
+            r = requests.post(url, data=f.read(), timeout=60, headers={
+                "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": 형식, "x-upsert": "false", "cache-control": "31536000"})
+    except Exception as e:
+        return "실패", str(e)[:120]
+    if r.status_code in (200, 201):
+        return "올림", ""
+    글 = r.text or ""
+    if r.status_code == 409 or "Duplicate" in 글 or "already exists" in 글:
+        return "이미있음", ""
+    return "실패", f"{r.status_code} {글[:120]}"
+
+
+def 보관함_올리기(차량번호들=None):
+    """이 PC 의 사진(원본만, 20KB 이상)·상세 원문·기록부 원문을 Supabase 보관함에 올림.
+    차량번호들 이 있으면 그 차만, 없으면 전부. 이미 올린 파일은 건너뜀 (보관함올림 표)."""
+    global _보관함_꺼짐
+    if _보관함_꺼짐 or not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    db = DB_연결()
+    try:
+        db.execute("CREATE TABLE IF NOT EXISTS 보관함올림 (경로 TEXT PRIMARY KEY, 크기 INTEGER, 올린때 TEXT)")
+        db.commit()
+        올린것 = {r[0] for r in db.execute("SELECT 경로 FROM 보관함올림")}
+    finally:
+        db.close()
+    안전들 = None
+    if 차량번호들 is not None:
+        안전들 = {re.sub(r'[\\/:*?"<>|]', "_", n or "") for n in 차량번호들}
+
+    할일 = []  # (로컬경로, 보관경로, 형식)
+    if os.path.isdir(사진_폴더):
+        for f in os.listdir(사진_폴더):
+            if not f.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+                continue
+            로컬 = os.path.join(사진_폴더, f)
+            if os.path.getsize(로컬) < 20000:
+                continue  # 미리보기(_TH)는 안 올림 — 원본 받은 뒤에 올라감
+            m = re.match(r"(.+?)(?:_(\d+))?\.(\w+)$", f)
+            차 = m.group(1) if m else f
+            if 안전들 is not None and 차 not in 안전들:
+                continue
+            형식 = "image/png" if f.lower().endswith(".png") else ("image/webp" if f.lower().endswith(".webp") else "image/jpeg")
+            할일.append((로컬, f"photos/{차}/{f}", 형식))
+    for 폴더, 앞 in ((상세원문_폴더, "raw/detail"), (기록부원문_폴더, "raw/record")):
+        if not os.path.isdir(폴더):
+            continue
+        for f in os.listdir(폴더):
+            if not f.endswith(".html.gz"):
+                continue
+            if 안전들 is not None and f[:-len(".html.gz")] not in 안전들:
+                continue
+            할일.append((os.path.join(폴더, f), f"{앞}/{f}", "application/gzip"))
+    할일 = [x for x in 할일 if x[1] not in 올린것]
+    if not 할일:
+        print("\n  보관함 올리기: 새로 올릴 파일 없음")
+        return
+    print(f"\n  보관함 올리기: {len(할일)}개 (사진·원문, Supabase 비공개 보관함)")
+    결과 = {"올림": 0, "이미있음": 0, "실패": 0}
+    연속실패 = 0
+    새기록 = []
+    for k, (로컬, 경로, 형식) in enumerate(할일):
+        상태, 이유 = _보관함_한개(로컬, 경로, 형식)
+        결과[상태] += 1
+        if 상태 == "실패":
+            연속실패 += 1
+            if 연속실패 <= 3:
+                print(f"  올리기 실패: {경로} — {이유}")
+            if 연속실패 >= 10:
+                _보관함_꺼짐 = True
+                print("  보관함 올리기가 10번 연속 실패해서 이번엔 그만함 (보관함_만들기.sql 실행했는지 확인)")
+                break
+        else:
+            연속실패 = 0
+            새기록.append((경로, os.path.getsize(로컬), _지금글()))
+        if len(새기록) >= 200 or (k + 1) % 500 == 0:
+            _보관함_기록(새기록)
+            새기록 = []
+            print(f"  … {k + 1}/{len(할일)} (올림 {결과['올림']} · 이미 있음 {결과['이미있음']} · 실패 {결과['실패']})")
+    _보관함_기록(새기록)
+    print(f"  보관함 올리기 끝: 올림 {결과['올림']} · 이미 있음 {결과['이미있음']} · 실패 {결과['실패']}")
+
+
+def _보관함_기록(줄들):
+    if not 줄들:
+        return
+    db = DB_연결()
+    try:
+        db.executemany("INSERT OR REPLACE INTO 보관함올림 (경로, 크기, 올린때) VALUES (?,?,?)", 줄들)
+        db.commit()
+    finally:
+        db.close()
+
+
 def 사진_다운로드(차량_목록):
     os.makedirs(사진_폴더, exist_ok=True)
     세션 = requests.Session()
@@ -2466,6 +2573,13 @@ def 보고서_생성():
 def 메인():
     # 기록부만 채우기: --records (카매니저 로그인 없이 기록부 사이트만 엶)
     # 항목만 다시 뽑기: --items (사이트 접속 없음, 저장된 원문·기록부 글로 DB·Supabase 항목 칸 채우기)
+    # 보관함에 전부 올리기: --upload (이 PC 의 사진·원문 전체, 사이트 접속 없음)
+    if "--upload" in sys.argv:
+        DB_초기화()
+        print(f"\n  ===== 보관함 올리기 {_지금글()} (사이트 접속 없음) =====")
+        보관함_올리기(None)
+        return
+
     if "--items" in sys.argv:
         DB_초기화()
         Supabase_초기화()
@@ -2597,6 +2711,8 @@ def 메인():
             print("\n  사진 다운로드 중...")
             다운, 실패 = 사진_다운로드(받을것)
             print(f"  다운로드: {다운}장" + (f" (실패 {실패}건)" if 실패 else ""))
+            # 이번에 본 차들의 사진·원문을 Supabase 비공개 보관함에도 (카매니저 접속 없음)
+            보관함_올리기([차.get("차량번호") for 차 in 받을것 if 차.get("차량번호")])
 
         # 수집 기록
         db = DB_연결()
