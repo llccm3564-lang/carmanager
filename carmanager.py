@@ -242,10 +242,11 @@ DB_파일 = "매물_데이터.db"
 세션_갱신_상세 = 0
 
 # ── 속도·양 (11-23 gkvlfrl 이용제한 뒤 정함: 목록 59페이지/25분 만에 막힘) ──
-목록_수집_켜짐 = False     # 11-23 오찬: 목록은 일단 빼 둠 (이미 받은 차 상세부터). 다시 켤 땐 True
-한번_목록_페이지 = 7       # 실행 한 번에 목록 최대 7페이지 (350대)
+목록_수집_켜짐 = True      # 11-24 오찬: 2~3일마다 하루 동안 108페이지를 천천히 (들어오고 나간 차 확인)
+목록_끼우기_간격 = 6        # 상세 6대마다 목록 1페이지 (한 번 실행 100대면 목록 약 16페이지)
+한번_목록_페이지 = 7       # 상세 할 차가 없을 때(목록만 도는 실행) 한 번에 최대 7페이지 (350대)
 한번_상세_대수 = 100       # 실행 한 번에 상세 최대 100대 (11-24 오찬: 11-23 시험 실행과 같은 속도)
-하루_목록_페이지 = 20      # 하루 목록 최대 20페이지 (1,000대)
+하루_목록_페이지 = 120     # 하루 목록 최대 120페이지 (엠파크타워 전체 108페이지 + 겹침 여유)
 하루_상세_대수 = 0         # 하루 상세 상한. 0 = 제한 없음 (11-24 오찬: 200대 제한 없앰)
 목록_바퀴_간격_시간 = 48   # 한 지역 목록을 끝까지 다 훑으면 이틀 뒤에 다시
 대기_범위 = (20, 40)       # 목록 페이지 사이·상세 차 사이 랜덤 대기(초)
@@ -434,7 +435,7 @@ def DB_초기화():
         );
     """)
     # 기존 DB에 없는 컬럼 추가
-    for col in ["사진URL들 TEXT", "성능기록부 TEXT", "검색지역 TEXT", "기록부링크 TEXT"]:
+    for col in ["사진URL들 TEXT", "성능기록부 TEXT", "검색지역 TEXT", "기록부링크 TEXT", "항목 TEXT"]:
         try:
             db.execute(f"ALTER TABLE 차량 ADD COLUMN {col}")
         except Exception:
@@ -1221,6 +1222,36 @@ def _다음실행_정하기():
         print(f"  다음 실행 시각 저장 실패: {e}")
 
 
+def _소리(종류):
+    """이 PC 에 소리 파일이 있으면 틀기: 「문제」= 늑대(~/.claude/sounds/ask), 「끝」= 고양이(~/.claude/sounds). 없으면 조용히 넘어감."""
+    try:
+        import winsound
+        폴더 = os.path.expanduser("~/.claude/sounds/ask" if 종류 == "문제" else "~/.claude/sounds")
+        파일들 = [os.path.join(폴더, f) for f in os.listdir(폴더) if f.lower().endswith(".wav")]
+        if 파일들:
+            winsound.PlaySound(random.choice(파일들), winsound.SND_FILENAME)
+    except Exception:
+        pass
+
+
+def 항목_다시뽑기():
+    """상세를 받아 둔 차 전체의 항목을 저장된 원문·기록부 글에서 다시 뽑아 DB·Supabase 에 저장 (사이트 접속 없음)."""
+    db = DB_연결()
+    try:
+        rows = db.execute("SELECT 차량번호, 성능기록부 FROM 차량 WHERE 성능기록부 LIKE ?",
+                          (f'%"detail_v": {상세_버전}%',)).fetchall()
+    finally:
+        db.close()
+    print(f"  항목 다시 뽑기: {len(rows)}대")
+    for k, r in enumerate(rows):
+        try:
+            _상세_저장(r["차량번호"], json.loads(r["성능기록부"]))
+        except Exception as e:
+            print(f"  {r['차량번호'][:12]} 실패: {str(e)[:80]}")
+        if (k + 1) % 20 == 0 or k + 1 == len(rows):
+            print(f"  … {k + 1}/{len(rows)}")
+
+
 def _제한_확인(글, 어디):
     """페이지·응답에 이용제한 문구가 있으면 중지.txt 를 만들고 _이용제한감지 를 던진다."""
     if not 글:
@@ -1246,6 +1277,7 @@ def _제한_확인(글, 어디):
                     "이용제한을 푼 뒤 이 파일을 지우면 다시 돌아갑니다.\n")
     except Exception:
         pass
+    _소리("문제")
     raise _이용제한감지(어디)
 
 
@@ -1448,9 +1480,10 @@ def _목록_페이지_열기(드라이버):
         pass
 
 
-def 목록_이어서(드라이버, 아이디, 비밀번호, 최대페이지):
-    """지역 목록을 지난번 멈춘 페이지부터 최대페이지 만큼만 훑는다 (한 페이지 겹쳐서 밀림 대비).
-    끝 페이지까지 다 돌면 그 바퀴에서 못 본 차를 사라짐 처리하고, 다음 바퀴는 목록_바퀴_간격_시간 뒤."""
+def 목록_이어서(드라이버, 아이디, 비밀번호, 최대페이지, 겹침=True):
+    """지역 목록을 지난번 멈춘 페이지부터 최대페이지 만큼만 훑는다 (겹침=True 면 한 페이지 겹쳐서 밀림 대비).
+    끝 페이지까지 다 돌면 그 바퀴에서 못 본 차를 사라짐 처리하고, 다음 바퀴는 목록_바퀴_간격_시간 뒤.
+    상세 사이에 1페이지씩 끼워 부를 때는 실행에서 처음 한 번만 겹침=True."""
     global 목록_완료, 목록_신규
     목록_완료 = False
     목록_신규 = 0
@@ -1463,7 +1496,7 @@ def 목록_이어서(드라이버, 아이디, 비밀번호, 최대페이지):
         진행.update({"다음페이지": 1, "바퀴시작": _지금글()})
         _목록진행_쓰기(진행)
         print("  목록: 새 바퀴 시작 (1페이지부터)")
-    시작 = max(1, int(진행.get("다음페이지") or 1) - 1)
+    시작 = max(1, int(진행.get("다음페이지") or 1) - (1 if 겹침 else 0))
 
     if "/Car/Data" not in (드라이버.current_url or ""):
         _목록_페이지_열기(드라이버)
@@ -1689,11 +1722,55 @@ def _상세링크(encarno):
     return f"{사이트}/PopupFrame/CarDetailEnc?encarno={quote(encarno or '', safe='')}"
 
 
-_수파베이스_새칸_없음 = False  # performance_url / performance_summary 칸이 아직 없으면 True (SQL 실행 전)
+
+
+# 항목 → Supabase 칸 이름 (항목_칸_추가.sql 과 같아야 함)
+_상세칸 = {
+    "카매니저번호": "cm_car_no", "차명": "full_name", "차량번호": "car_number", "주행거리km": "mileage_km",
+    "연식": "model_year", "최초등록일": "first_registered", "제시번호": "presented_no", "제시일": "presented_date",
+    "조합": "union_name", "조합전화": "union_phone", "상사": "shop_name", "상사전화": "shop_phone",
+    "딜러": "dealer_name", "딜러전화": "dealer_phone", "종사원증번호": "dealer_license",
+    "한줄광고·사고내역": "ad_line", "압류건수": "seizure_count", "저당건수": "mortgage_count",
+    "세금미납정보": "unpaid_tax", "차량상세설명": "description", "옵션": "options", "옵션수": "option_count",
+    "사진수": "photo_count",
+}
+_기록부칸 = {
+    "발행번호": "record_no", "차대번호": "vin", "검사유효기간": "inspection_valid", "기록부주행거리km": "record_mileage_km",
+    "사고이력": "accident", "단순수리": "simple_repair", "주요골격": "frame_damage", "외판1랭크": "outer_panel_1",
+    "외판2랭크": "outer_panel_2", "교환판금부위": "repaired_parts", "용도변경": "usage_change",
+    "특별이력": "special_history", "튜닝": "tuning", "리콜": "recall", "주요장치이상": "engine_issues",
+    "특기사항": "inspector_note",
+}
+_수파베이스_새칸_없음 = False  # 새 칸이 아직 없으면 True (SQL 실행 전) → 그 칸들만 빼고 저장
+
+
+def _항목_만들기(번호, 성능):
+    """저장된 상세 원문 + 성능기록부 글에서 항목(값/없음/오류) 뽑기. 사이트 접속 없음."""
+    import 항목뽑기 as 뽑
+    상 = 뽑.상세_항목(원문_읽기(상세원문_폴더, 번호))
+    기록 = 성능.get("record") or {}
+    if not 기록:
+        기 = 뽑.기록부_항목("", False, "기록부 위치 없음")
+    elif 기록.get("kind") == "카매니저자체":
+        기 = {k: {"값": None, "상태": "오류", "이유": "카매니저 자체 기록부(아직 안 받음)"} for k in 뽑.기록부_항목_이름}
+    elif not 기록.get("rendered"):
+        기 = {k: {"값": None, "상태": "오류", "이유": "기록부 아직 안 읽음"} for k in 뽑.기록부_항목_이름}
+    else:
+        기 = 뽑.기록부_항목(기록.get("text", ""), bool(기록.get("exists")))
+    return 상, 기
+
+
+def _칸값(v):
+    x = v.get("값") if v.get("상태") == "값" else None
+    if isinstance(x, list):
+        x = " | ".join(str(a) for a in x)
+    return x
 
 
 def _상세_저장(번호, 성능, 사진들=None):
-    """상세 결과를 로컬 DB + Supabase 에 저장. 기록부 링크(누구나 열림)·요약은 따로 칸에도."""
+    """상세 결과를 로컬 DB + Supabase 에 저장.
+    - 항목(항목뽑기): 칸별 값 + 항목마다 「값/없음/오류」 상태 (items_json), 오류·없음 항목 목록
+    - 기록부 링크(누구나 열림)·요약"""
     global _수파베이스_새칸_없음
     성능JSON = json.dumps(성능, ensure_ascii=False)
     기록 = 성능.get("record") or {}
@@ -1706,35 +1783,57 @@ def _상세_저장(번호, 성능, 사진들=None):
     요약JSON = json.dumps(요약, ensure_ascii=False) if 요약 else None
     사진JSON = json.dumps(사진들, ensure_ascii=False) if 사진들 else None
 
+    try:
+        상, 기 = _항목_만들기(번호, 성능)
+    except Exception as e:
+        print(f"(항목 뽑기 실패: {str(e)[:60]}) ", end="")
+        상, 기 = {}, {}
+    항목 = {"상세": 상, "기록부": 기, "갱신": _지금글()}
+    항목JSON = json.dumps(항목, ensure_ascii=False)
+    오류들 = [f"{묶}.{k}" for 묶, d in (("상세", 상), ("기록부", 기)) for k, v in d.items() if v.get("상태") == "오류"]
+
     db = DB_연결()
     try:
-        db.execute("UPDATE 차량 SET 사진URL들=COALESCE(?,사진URL들), 성능기록부=?, 기록부링크=COALESCE(?,기록부링크) "
-                   "WHERE 차량번호=?", (사진JSON, 성능JSON, 링크, 번호))
+        db.execute("UPDATE 차량 SET 사진URL들=COALESCE(?,사진URL들), 성능기록부=?, 기록부링크=COALESCE(?,기록부링크), "
+                   "항목=? WHERE 차량번호=?", (사진JSON, 성능JSON, 링크, 항목JSON, 번호))
         db.commit()
     finally:
         db.close()
 
     if not supabase_client:
         return
-    업데이트 = {"performance_record": 성능JSON}
+    기본 = {"performance_record": 성능JSON}
     if 사진JSON:
-        업데이트["photo_urls"] = 사진JSON
+        기본["photo_urls"] = 사진JSON
     새칸 = {}
     if 링크:
         새칸["performance_url"] = 링크
     if 요약JSON:
         새칸["performance_summary"] = 요약JSON
+    for k, 칸 in _상세칸.items():
+        if k in 상:
+            새칸[칸] = _칸값(상[k])
+    for k, 칸 in _기록부칸.items():
+        if k in 기:
+            새칸[칸] = _칸값(기[k])
+    if 기:
+        새칸["record_exists"] = "있음" if 기록.get("exists") else ("확인 전" if 기록 and not 기록.get("rendered") else "없음")
+    새칸["items_json"] = 항목JSON
+    새칸["items_errors"] = ", ".join(오류들) if 오류들 else None
+    새칸["items_updated_at"] = datetime.now().isoformat()
     테이블 = supabase_client.table("car_listings")
-    if 새칸 and not _수파베이스_새칸_없음:
+    if not _수파베이스_새칸_없음:
         try:
-            테이블.update(dict(업데이트, **새칸)).eq("car_id", 번호).execute()
+            테이블.update(dict(기본, **새칸)).eq("car_id", 번호).execute()
             return
         except Exception as e:
-            if "performance_url" in str(e) or "performance_summary" in str(e) or "column" in str(e).lower():
+            if "column" in str(e).lower() or "schema" in str(e).lower():
                 _수파베이스_새칸_없음 = True
-                print("\n  (Supabase 에 기록부 링크·요약 칸이 아직 없어서 그 둘은 빼고 저장. SQL 실행하면 다음부터 들어감)")
+                print("\n  (Supabase 에 항목 칸이 아직 없어서 항목은 빼고 저장. 항목_칸_추가.sql 실행하면 다음부터 들어감)")
+            else:
+                print(f"\n  (Supabase 저장 실패: {str(e)[:100]})")
     try:
-        테이블.update(업데이트).eq("car_id", 번호).execute()
+        테이블.update(기본).eq("car_id", 번호).execute()
     except Exception:
         pass
 
@@ -1993,8 +2092,9 @@ def _상세버전_정리():
               f"나머지 {len(rows) - 올림}대는 상세 다시 받기 대상")
 
 
-def 상세_사진_수집(드라이버, 차량_목록, 최대=None):
-    """각 차량 상세 페이지에서 사진 전체·내용·성능기록부 수집 (최대 대수만큼)"""
+def 상세_사진_수집(드라이버, 차량_목록, 최대=None, 끼워넣기=None):
+    """각 차량 상세 페이지에서 사진 전체·내용·성능기록부 수집 (최대 대수만큼).
+    끼워넣기: 상세 목록_끼우기_간격 대마다 부를 함수 (목록 1페이지 받기). 없으면 상세만."""
     최대 = 한번_상세_대수 if 최대 is None else 최대
 
     # 이미 상세를 끝낸 차량 제외
@@ -2064,6 +2164,15 @@ def 상세_사진_수집(드라이버, 차량_목록, 최대=None):
 
         if i > 0:
             time.sleep(random.uniform(*대기_범위))
+            # 상세 사이사이에 목록 1페이지 (같은 간격으로 한 번 더 쉬고)
+            if 끼워넣기 and i % 목록_끼우기_간격 == 0:
+                try:
+                    if 끼워넣기():
+                        time.sleep(random.uniform(*대기_범위))
+                except _이용제한감지:
+                    raise
+                except Exception as e:
+                    print(f"\n  (목록 끼워넣기 실패: {str(e)[:80]})")
         print(f"  [{i+1:>4}/{len(배치)}] {차종:20s} ", end="", flush=True)
 
         try:
@@ -2252,6 +2361,7 @@ def 상세_사진_수집(드라이버, 차량_목록, 최대=None):
 
         if 연속_이상 >= 3:
             print("  상세가 3번 연속 이상해서 이번 실행의 상세는 여기서 멈춤")
+            _소리("문제")
             break
 
     print(f"\n  상세 완료: {수집_성공}대에서 사진 총 {총_장수}장")
@@ -2355,6 +2465,14 @@ def 보고서_생성():
 # ════════════════════════════════════════════════════════════
 def 메인():
     # 기록부만 채우기: --records (카매니저 로그인 없이 기록부 사이트만 엶)
+    # 항목만 다시 뽑기: --items (사이트 접속 없음, 저장된 원문·기록부 글로 DB·Supabase 항목 칸 채우기)
+    if "--items" in sys.argv:
+        DB_초기화()
+        Supabase_초기화()
+        print(f"\n  ===== 항목 다시 뽑기 {_지금글()} (사이트 접속 없음) =====")
+        항목_다시뽑기()
+        return
+
     if "--records" in sys.argv:
         DB_초기화()
         Supabase_초기화()
@@ -2425,29 +2543,46 @@ def 메인():
         if not 로그인(드라이버, 아이디, 비밀번호):
             return
 
-        # 1) 상세 먼저 — DB 에 있는 등록중 차 중 아직 안 받은 차
+        # 목록 끼워넣기: 상세 6대마다 목록 1페이지 (목록 차례이고 오늘 상한이 남았을 때만)
+        목록_상태 = {"받은페이지": 0, "첫번째": True, "차량": []}
+
+        def 목록_한페이지():
+            if not 목록_수집_켜짐:
+                return False
+            if 하루사용_읽기()["목록페이지"] >= 하루_목록_페이지 or not 목록_할_차례()[0]:
+                return False
+            print()
+            받은 = 목록_이어서(드라이버, 아이디, 비밀번호, 1, 겹침=목록_상태["첫번째"])
+            목록_상태["첫번째"] = False
+            목록_상태["받은페이지"] += 1
+            목록_상태["차량"].extend(받은)
+            return True
+
+        # 1) 상세 먼저 — DB 에 있는 등록중 차 중 아직 안 받은 차 (사이사이에 목록 1페이지씩)
         사용 = 하루사용_읽기()
         남은상세 = 한번_상세_대수 if 하루_상세_대수 <= 0 else min(한번_상세_대수, 하루_상세_대수 - 사용["상세"])
         if 남은상세 > 0:
             상세대상 = DB_상세_대상(남은상세)
             if 상세대상:
-                상세_사진_수집(드라이버, 상세대상, 남은상세)
-                # 상세에서 주소만 받아 둔 엠파크 기록부 내용 채우기 (기록부 사이트만, 카매니저 요청 없음)
+                상세_사진_수집(드라이버, 상세대상, 남은상세, 끼워넣기=목록_한페이지)
+                # 상세에서 주소만 받아 둔 기록부 내용 채우기 (기록부 사이트만, 카매니저 요청 없음)
                 기록부_채우기(드라이버, 최대=len(상세대상) + 10)
             else:
                 print("\n  상세: 남은 차 없음")
         else:
             print(f"\n  상세: 오늘 상한 {하루_상세_대수}대 다 씀")
+        차량_목록 = 목록_상태["차량"]
 
-        # 2) 목록 — 한 바퀴 도는 중이면 이어서, 다 돌았으면 이틀 뒤
+        # 2) 목록만 도는 실행 — 상세 할 차가 없을 때 한 번에 최대 7페이지
         사용 = 하루사용_읽기()
         남은목록 = min(한번_목록_페이지, 하루_목록_페이지 - 사용["목록페이지"])
         차례, 차례이유 = 목록_할_차례()
         if not 목록_수집_켜짐:
             print(f"\n  목록: 꺼 둠 (다음에 켜면 {_목록진행_읽기().get('다음페이지')}페이지부터 이어서)")
+        elif 목록_상태["받은페이지"]:
+            print(f"\n  목록: 상세 사이사이에 {목록_상태['받은페이지']}페이지 받음 "
+                  f"(다음은 {_목록진행_읽기().get('다음페이지') or 1}페이지부터)")
         elif 남은목록 > 0 and 차례:
-            if 상세대상:
-                time.sleep(random.uniform(*대기_범위))  # 상세와 목록 사이도 사람처럼 쉼
             print(f"\n  목록: {차례이유}")
             차량_목록 = 목록_이어서(드라이버, 아이디, 비밀번호, 남은목록)
             print(f"  목록: 이번에 {len(차량_목록)}대 확인, 신규 {목록_신규}대")
@@ -2476,6 +2611,9 @@ def 메인():
 
     except _이용제한감지 as e:
         print(f"\n  이용제한 감지로 멈춤 ({e}). 중지.txt 가 생겨서 다음 실행부터는 아무것도 안 합니다.")
+    except Exception:
+        _소리("문제")
+        raise
     finally:
         try:
             드라이버.quit()
@@ -2486,6 +2624,7 @@ def 메인():
         print(f"  오늘 누적: 상세 {사용['상세']}대 · 목록 {사용['목록페이지']}페이지 · 로그인 {사용['로그인']}번")
 
     print("\n  완료!")
+    _소리("끝")
     if not HEADLESS:
         input("  엔터를 누르면 종료...")
 
