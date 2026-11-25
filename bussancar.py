@@ -173,18 +173,57 @@ except ImportError:
 # ════════════════════════════════════════════════════════════
 # 설정
 # ════════════════════════════════════════════════════════════
-API_URL = "https://bussancar.com/proxy/api/v1/vehicle/list"
+API_목록_URL = "https://bussancar.com/proxy/api/v1/vehicle/list"
+API_상세_URL = "https://bussancar.com/proxy/api/v1/vehicle/"
 DB_파일 = "매물_데이터.db"
 보고서_파일 = "매물_보고서.csv"
 페이지_크기 = 100
-대기_범위 = (2, 5)
+대기_범위 = (1, 8)
+긴쉼_주기 = 10
+긴쉼_범위 = (15, 30)
+세션끊기_주기 = 200
+세션끊기_범위 = (60, 120)
+상세_대기_범위 = (2, 10)
+상세_긴쉼_주기 = 30
+상세_긴쉼_범위 = (20, 45)
+상세_세션끊기_주기 = 500
+상세_세션끊기_범위 = (60, 180)
+하루_상세_상한 = 5000
+사진_루트 = os.environ.get("PHOTO_DIR", os.path.join("D:\\", "사진_부싼카"))
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 PROXY_URL = os.environ.get("PROXY_URL", "")
 
+def _프록시_목록_로드():
+    목록 = []
+    경로 = os.path.join(_script_dir, "proxies.txt")
+    if os.path.exists(경로):
+        with open(경로, "r", encoding="utf-8") as f:
+            for 줄 in f:
+                줄 = 줄.strip()
+                if 줄 and not 줄.startswith("#"):
+                    if not 줄.startswith("http"):
+                        줄 = "http://" + 줄
+                    목록.append(줄)
+    if PROXY_URL and PROXY_URL not in 목록:
+        목록.insert(0, PROXY_URL)
+    return 목록
+
+프록시_목록 = _프록시_목록_로드()
+_프록시_순번 = 0
+
+def _다음_프록시():
+    global _프록시_순번
+    if not 프록시_목록:
+        return ""
+    p = 프록시_목록[_프록시_순번 % len(프록시_목록)]
+    _프록시_순번 += 1
+    return p
+
 테스트모드 = "--test" in sys.argv
-프록시_사용 = "--proxy" in sys.argv or bool(PROXY_URL)
+목록만 = "--list-only" in sys.argv
+프록시_사용 = "--proxy" in sys.argv or bool(PROXY_URL) or bool(프록시_목록)
 supabase_client = None
 
 
@@ -323,7 +362,10 @@ def DB_초기화():
             최초발견 TEXT,
             최근확인 TEXT,
             상태 TEXT DEFAULT '등록중',
-            사라진날 TEXT
+            사라진날 TEXT,
+            상세완료 INTEGER DEFAULT 0,
+            옵션 TEXT,
+            차대번호 TEXT
         );
 
         CREATE TABLE IF NOT EXISTS 수집기록 (
@@ -334,6 +376,18 @@ def DB_초기화():
             사라진_건수 INTEGER
         );
     """)
+    try:
+        db.execute("ALTER TABLE 차량 ADD COLUMN 상세완료 INTEGER DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        db.execute("ALTER TABLE 차량 ADD COLUMN 옵션 TEXT")
+    except Exception:
+        pass
+    try:
+        db.execute("ALTER TABLE 차량 ADD COLUMN 차대번호 TEXT")
+    except Exception:
+        pass
     db.commit()
     db.close()
 
@@ -426,15 +480,16 @@ def _세션_만들기():
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "ko-KR,ko;q=0.9",
     })
-    if 프록시_사용 and PROXY_URL:
-        s.proxies = {"http": PROXY_URL, "https": PROXY_URL}
-        print(f"  프록시: {PROXY_URL[:40]}...")
+    if 프록시_사용 and 프록시_목록:
+        p = _다음_프록시()
+        s.proxies = {"http": p, "https": p}
+        print(f"  프록시: {p[:40]}...")
     return s
 
 
 def API_매물_가져오기(세션, 페이지, 크기=100):
     try:
-        r = 세션.get(API_URL, params={"page": 페이지, "size": 크기}, timeout=30)
+        r = 세션.get(API_목록_URL, params={"page": 페이지, "size": 크기}, timeout=30)
         r.raise_for_status()
         data = r.json()
         if not data.get("success"):
@@ -447,6 +502,51 @@ def API_매물_가져오기(세션, 페이지, 크기=100):
     except (KeyError, json.JSONDecodeError) as e:
         print(f"  API 응답 파싱 실패: {str(e)[:100]}")
         return None, 0
+
+
+def API_상세_가져오기(세션, 차량번호):
+    try:
+        r = 세션.get(f"{API_상세_URL}{차량번호}", timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("success"):
+            return None
+        return data["data"]
+    except Exception:
+        return None
+
+
+def 사진_다운로드(세션, 이미지목록, 차량번호):
+    사진폴더 = os.path.join(사진_루트, str(차량번호))
+    os.makedirs(사진폴더, exist_ok=True)
+
+    저장된 = []
+    for img in 이미지목록:
+        url = img.get("imageUrl", "")
+        순번 = img.get("sortNo", 0)
+        if not url:
+            continue
+
+        확장자 = ".jpg"
+        if ".png" in url.lower():
+            확장자 = ".png"
+        파일명 = f"{순번:02d}{확장자}"
+        경로 = os.path.join(사진폴더, 파일명)
+
+        if os.path.exists(경로):
+            저장된.append(경로)
+            continue
+
+        try:
+            r = 세션.get(url, timeout=30)
+            r.raise_for_status()
+            with open(경로, "wb") as f:
+                f.write(r.content)
+            저장된.append(경로)
+        except Exception:
+            pass
+
+    return 저장된
 
 
 def API_차량_변환(item):
@@ -486,6 +586,85 @@ def API_차량_변환(item):
         "사진URL": v.get("thumbnail", ""),
         "상세링크": f"https://bussancar.com/buy-car/{v.get('carNo', '')}",
     }
+
+
+def 상세_파싱(세션):
+    db = DB_연결()
+    미완료 = db.execute(
+        "SELECT 차량번호 FROM 차량 WHERE 상태='등록중' AND (상세완료 IS NULL OR 상세완료=0)"
+    ).fetchall()
+    db.close()
+
+    대상 = [row["차량번호"] for row in 미완료]
+    if not 대상:
+        print("  상세 파싱: 모든 차량 완료됨")
+        return 0
+
+    상한 = min(len(대상), 하루_상세_상한)
+    if 테스트모드:
+        상한 = min(len(대상), 5)
+    print(f"  상세 파싱: 미완료 {len(대상)}대 중 {상한}대 진행")
+
+    완료 = 0
+    실패 = 0
+
+    for i, 번호 in enumerate(대상[:상한]):
+        if i > 0:
+            if i % 상세_세션끊기_주기 == 0:
+                쉼 = random.uniform(*상세_세션끊기_범위)
+                print(f"  --- 상세 {i}건: 세션 쉼 {쉼:.0f}초 ---")
+                time.sleep(쉼)
+                세션 = _세션_만들기()
+            elif i % 상세_긴쉼_주기 == 0:
+                쉼 = random.uniform(*상세_긴쉼_범위)
+                print(f"  --- 상세 {i}건: 잠깐 쉼 {쉼:.0f}초 ---")
+                time.sleep(쉼)
+            else:
+                대기 = random.uniform(*상세_대기_범위)
+                time.sleep(대기)
+
+        상세 = API_상세_가져오기(세션, 번호)
+        if not 상세:
+            실패 += 1
+            if i % 100 == 0:
+                print(f"  상세 {i+1}/{상한}: {번호} 실패")
+            continue
+
+        이미지들 = 상세.get("images", [])
+        사진URL들 = ",".join(img.get("imageUrl", "") for img in 이미지들 if img.get("imageUrl"))
+        옵션 = 상세.get("carOption", "")
+        차대번호 = 상세.get("carFrameNo", "")
+        성능기록부 = 상세.get("checkoutUrl", "")
+        원본 = json.dumps(상세, ensure_ascii=False)
+
+        저장된사진 = 사진_다운로드(세션, 이미지들, 번호)
+
+        db = DB_연결()
+        db.execute("""
+            UPDATE 차량
+            SET 사진URL들=?, 성능기록부=?, 옵션=?, 차대번호=?, 원본데이터=?, 상세완료=1
+            WHERE 차량번호=?
+        """, (사진URL들, 성능기록부, 옵션, 차대번호, 원본, 번호))
+        db.commit()
+        db.close()
+
+        if supabase_client:
+            try:
+                supabase_client.table("car_listings").update({
+                    "photo_urls": 사진URL들,
+                }).eq("car_id", 번호).execute()
+            except Exception:
+                pass
+
+        완료 += 1
+        if (i + 1) % 100 == 0:
+            print(f"  상세 {i+1}/{상한}: 완료 {완료}대 / 실패 {실패}대 / 사진 {len(저장된사진)}장")
+
+    print(f"  상세 파싱 완료: {완료}대 성공, {실패}대 실패")
+    남은 = len(대상) - 상한
+    if 남은 > 0:
+        print(f"  남은 미완료: {남은}대 (다음 실행에서 계속)")
+    return 완료
 
 
 # ════════════════════════════════════════════════════════════
@@ -568,8 +747,18 @@ def 메인():
         if len(전체_차량) >= 최대:
             break
 
-        대기 = random.uniform(*대기_범위)
-        time.sleep(대기)
+        if p % 세션끊기_주기 == 0:
+            쉼 = random.uniform(*세션끊기_범위)
+            print(f"  --- {p}페이지: 세션 쉼 {쉼:.0f}초 (새 탭 열듯) ---")
+            time.sleep(쉼)
+            세션 = _세션_만들기()
+        elif p % 긴쉼_주기 == 0:
+            쉼 = random.uniform(*긴쉼_범위)
+            print(f"  --- {p}페이지: 잠깐 쉼 {쉼:.0f}초 ---")
+            time.sleep(쉼)
+        else:
+            대기 = random.uniform(*대기_범위)
+            time.sleep(대기)
 
         items, _ = API_매물_가져오기(세션, p, 페이지_크기)
         if items is None:
@@ -583,7 +772,7 @@ def 메인():
             if len(전체_차량) >= 최대:
                 break
 
-        print(f"  {p}/{총페이지}페이지: 누적 {len(전체_차량)}대 (대기 {대기:.1f}초)")
+        print(f"  {p}/{총페이지}페이지: 누적 {len(전체_차량)}대")
 
     if not 전체_차량:
         print("  수집된 차량 없음. 종료.")
@@ -613,14 +802,26 @@ def 메인():
 
     보고서_생성()
 
+    if not 목록만:
+        print(f"\n  ===== 상세 파싱 시작 =====")
+        상세완료 = 상세_파싱(세션)
+    else:
+        상세완료 = 0
+        print("  --list-only: 상세 파싱 건너뜀")
+
     db = DB_연결()
     총등록 = db.execute("SELECT COUNT(*) FROM 차량 WHERE 상태='등록중'").fetchone()[0]
     총사라짐 = db.execute("SELECT COUNT(*) FROM 차량 WHERE 상태='사라짐'").fetchone()[0]
+    총상세 = db.execute("SELECT COUNT(*) FROM 차량 WHERE 상세완료=1").fetchone()[0]
+    미상세 = db.execute("SELECT COUNT(*) FROM 차량 WHERE 상태='등록중' AND (상세완료 IS NULL OR 상세완료=0)").fetchone()[0]
     db.close()
 
     print(f"\n  ===== 완료 =====")
     print(f"  이번 수집: {len(전체_차량)}대 (신규 {신규}대)")
+    if 상세완료 > 0:
+        print(f"  이번 상세: {상세완료}대")
     print(f"  DB 현황: 등록중 {총등록:,}대 / 사라짐 {총사라짐:,}대")
+    print(f"  상세 현황: 완료 {총상세:,}대 / 미완료 {미상세:,}대")
 
     if 전체_차량:
         예시 = 전체_차량[0]
