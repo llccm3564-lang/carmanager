@@ -26,7 +26,18 @@ import json
 import random
 from datetime import datetime
 
+import base64
+from urllib.parse import quote
+
 import requests
+
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options as ChromeOptions
+    from selenium.webdriver.chrome.service import Service as ChromeService
+    SELENIUM_OK = True
+except ImportError:
+    SELENIUM_OK = False
 
 try:
     from dotenv import load_dotenv
@@ -525,33 +536,96 @@ def API_상세_가져오기(세션, 차량번호):
         return None
 
 
-def 사진_다운로드(세션, 이미지목록, 차량번호):
+_사진_브라우저 = None
+
+
+def _사진_브라우저_시작():
+    global _사진_브라우저
+    if _사진_브라우저:
+        try:
+            _ = _사진_브라우저.title
+            return _사진_브라우저
+        except Exception:
+            _사진_브라우저 = None
+
+    if not SELENIUM_OK:
+        print("  selenium 없음 — 사진 다운로드 건너뜀")
+        return None
+
+    opts = ChromeOptions()
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--window-size=1280,720")
+    opts.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+    try:
+        _사진_브라우저 = webdriver.Chrome(options=opts)
+        _사진_브라우저.set_page_load_timeout(30)
+        print("  사진 브라우저 시작됨 (headless Chrome)")
+        return _사진_브라우저
+    except Exception as e:
+        print(f"  사진 브라우저 시작 실패: {str(e)[:80]}")
+        return None
+
+
+def _사진_브라우저_종료():
+    global _사진_브라우저
+    if _사진_브라우저:
+        try:
+            _사진_브라우저.quit()
+        except Exception:
+            pass
+        _사진_브라우저 = None
+
+
+def 사진_다운로드(이미지목록, 차량번호):
     사진폴더 = os.path.join(사진_루트, str(차량번호))
     os.makedirs(사진폴더, exist_ok=True)
 
     저장된 = []
+    건너뜀 = 0
+
     for img in 이미지목록:
         url = img.get("imageUrl", "")
         순번 = img.get("sortNo", 0)
         if not url:
             continue
 
-        확장자 = ".jpg"
-        if ".png" in url.lower():
-            확장자 = ".png"
+        확장자 = ".png" if ".png" in url.lower() else ".jpg"
         파일명 = f"{순번:02d}{확장자}"
         경로 = os.path.join(사진폴더, 파일명)
 
         if os.path.exists(경로):
             저장된.append(경로)
+            건너뜀 += 1
             continue
 
+        driver = _사진_브라우저_시작()
+        if not driver:
+            break
+
         try:
-            r = 세션.get(url, timeout=30)
-            r.raise_for_status()
-            with open(경로, "wb") as f:
-                f.write(r.content)
-            저장된.append(경로)
+            driver.get(url)
+            time.sleep(0.3)
+            데이터 = driver.execute_script("""
+                var img = document.querySelector('img');
+                if (!img || !img.complete || !img.naturalWidth) return null;
+                var c = document.createElement('canvas');
+                c.width = img.naturalWidth;
+                c.height = img.naturalHeight;
+                c.getContext('2d').drawImage(img, 0, 0);
+                var fmt = arguments[0] === '.png' ? 'image/png' : 'image/jpeg';
+                return c.toDataURL(fmt, 1.0).split(',')[1];
+            """, 확장자)
+            if 데이터:
+                with open(경로, "wb") as f:
+                    f.write(base64.b64decode(데이터))
+                저장된.append(경로)
         except Exception:
             pass
 
@@ -604,7 +678,11 @@ def 상세_파싱(세션):
     ).fetchall()
     db.close()
 
-    대상 = [row["차량번호"] for row in 미완료]
+    전체대상 = [row["차량번호"] for row in 미완료]
+    대상 = [n for n in 전체대상 if str(n).isdigit()]
+    건너뜀 = len(전체대상) - len(대상)
+    if 건너뜀 > 0:
+        print(f"  상세 파싱: 숫자 아닌 옛 carNo {건너뜀}건 건너뜀 (카매니저 데이터)")
     if not 대상:
         print("  상세 파싱: 모든 차량 완료됨")
         return 0
@@ -639,14 +717,15 @@ def 상세_파싱(세션):
                 print(f"  상세 {i+1}/{상한}: {번호} 실패")
             continue
 
-        이미지들 = 상세.get("images", [])
+        vi = 상세.get("vehicleInventory", {})
+        이미지들 = vi.get("images", []) or []
         사진URL들 = ",".join(img.get("imageUrl", "") for img in 이미지들 if img.get("imageUrl"))
-        옵션 = 상세.get("carOption", "")
-        차대번호 = 상세.get("carFrameNo", "")
-        성능기록부 = 상세.get("checkoutUrl", "")
+        옵션 = vi.get("carOption", "")
+        차대번호 = vi.get("carFrameNo", "")
+        성능기록부 = vi.get("checkoutUrl", "")
         원본 = json.dumps(상세, ensure_ascii=False)
 
-        저장된사진 = 사진_다운로드(세션, 이미지들, 번호)
+        저장된사진 = 사진_다운로드(이미지들, 번호)
 
         db = DB_연결()
         db.execute("""
@@ -836,6 +915,8 @@ def 메인():
         예시 = 전체_차량[0]
         print(f"\n  [예시] {예시['차종']} | {예시['가격']} | {예시['연식']}년 | "
               f"{예시['주행거리']} | {예시['번호판']} | {예시['지역']}")
+
+    _사진_브라우저_종료()
 
 
 if __name__ == "__main__":
