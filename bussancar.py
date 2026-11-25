@@ -197,6 +197,14 @@ PROXY_URL = os.environ.get("PROXY_URL", "")
 
 def _프록시_목록_로드():
     목록 = []
+    env_list = os.environ.get("PROXY_LIST", "")
+    if env_list:
+        for 줄 in env_list.split(","):
+            줄 = 줄.strip()
+            if 줄:
+                if not 줄.startswith("http"):
+                    줄 = "http://" + 줄
+                목록.append(줄)
     경로 = os.path.join(_script_dir, "proxies.txt")
     if os.path.exists(경로):
         with open(경로, "r", encoding="utf-8") as f:
@@ -205,7 +213,8 @@ def _프록시_목록_로드():
                 if 줄 and not 줄.startswith("#"):
                     if not 줄.startswith("http"):
                         줄 = "http://" + 줄
-                    목록.append(줄)
+                    if 줄 not in 목록:
+                        목록.append(줄)
     if PROXY_URL and PROXY_URL not in 목록:
         목록.insert(0, PROXY_URL)
     return 목록
